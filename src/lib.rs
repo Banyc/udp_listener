@@ -16,36 +16,36 @@ pub const BUFFER_LENGTH: usize = 2_usize.pow(16);
 
 pub type Packet = LinearOwnedReusable<BytesMut>;
 
-pub type DispatchKey<K> = Arc<dyn Fn(SocketAddr, &Packet) -> K + Sync + Send + 'static>;
+pub type Dispatch<K, V> = Arc<dyn Fn(SocketAddr, Packet) -> (K, V) + Sync + Send + 'static>;
 
-pub struct UdpListener<K> {
+pub struct UdpListener<K, V> {
     udp: Arc<UdpSocket>,
-    accepted: ExpiringHashMap<K, tokio::sync::mpsc::Sender<Packet>>,
+    accepted: ExpiringHashMap<K, tokio::sync::mpsc::Sender<V>>,
     buf_pool: Arc<LinearObjectPool<BytesMut>>,
     dispatcher_buffer_size: NonZeroUsize,
-    dispatch_key: DispatchKey<K>,
+    dispatch: Dispatch<K, V>,
 }
-impl UdpListener<SocketAddr> {
-    pub fn new_socket_addr(
+impl UdpListener<SocketAddr, Packet> {
+    pub fn new_identity_dispatch(
         udp: UdpSocket,
         idle_timeout: Duration,
         dispatcher_buffer_size: NonZeroUsize,
     ) -> Self {
-        let dispatch_key = |addr: SocketAddr, _: &Packet| addr;
+        let dispatch = |addr: SocketAddr, packet: Packet| (addr, packet);
         UdpListener::new(
             udp,
             idle_timeout,
             dispatcher_buffer_size,
-            Arc::new(dispatch_key),
+            Arc::new(dispatch),
         )
     }
 }
-impl<K> UdpListener<K> {
+impl<K, V> UdpListener<K, V> {
     pub fn new(
         udp: UdpSocket,
         idle_timeout: Duration,
         dispatcher_buffer_size: NonZeroUsize,
-        dispatch_key: DispatchKey<K>,
+        dispatch_key: Dispatch<K, V>,
     ) -> Self {
         let accepted = ExpiringHashMap::new(idle_timeout);
         let buf_pool = Arc::new(LinearObjectPool::new(
@@ -57,43 +57,41 @@ impl<K> UdpListener<K> {
             accepted,
             buf_pool,
             dispatcher_buffer_size,
-            dispatch_key,
+            dispatch: dispatch_key,
         }
     }
 }
-impl<K> UdpListener<K>
+impl<K, V> UdpListener<K, V>
 where
     K: Clone + core::hash::Hash + Eq,
 {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn accept(&mut self) -> std::io::Result<AcceptedUdp<K>> {
-        let mut buf = self.buf_pool.pull_owned();
+    pub async fn accept(&mut self) -> std::io::Result<AcceptedUdp<K, V>> {
         loop {
+            let mut buf = self.buf_pool.pull_owned();
             let (n, addr) = self.udp.recv_buf_from(&mut *buf).await?;
             if n == BUFFER_LENGTH {
                 continue;
             }
 
-            let key = (self.dispatch_key)(addr, &buf);
+            let (key, mut value) = (self.dispatch)(addr, buf);
 
             if let Some(tx) = self.accepted.get(&key) {
-                let Err(e) = tx.try_send(buf) else {
-                    buf = self.buf_pool.pull_owned();
+                let Err(e) = tx.try_send(value) else {
                     continue;
                 };
                 match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(b) => {
-                        buf = b;
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         continue;
                     }
-                    tokio::sync::mpsc::error::TrySendError::Closed(b) => buf = b,
+                    tokio::sync::mpsc::error::TrySendError::Closed(v) => value = v,
                 }
             }
 
             let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
-            tx.try_send(buf).unwrap();
+            tx.try_send(value).unwrap();
             let shared_instant = SharedClone::new(Instant::now());
             self.accepted
                 .insert(key.clone(), tx, shared_instant.clone());
@@ -107,7 +105,7 @@ where
         }
     }
 }
-impl<K> core::fmt::Debug for UdpListener<K>
+impl<K, V> core::fmt::Debug for UdpListener<K, V>
 where
     K: core::fmt::Debug,
 {
@@ -121,16 +119,16 @@ where
 }
 
 #[derive(Debug)]
-pub struct AcceptedUdp<K> {
-    recv: tokio::sync::mpsc::Receiver<Packet>,
+pub struct AcceptedUdp<K, V> {
+    recv: tokio::sync::mpsc::Receiver<V>,
     udp: Arc<UdpSocket>,
     peer: SocketAddr,
     last_sent: SharedClone<Instant>,
     dispatch_key: K,
 }
-impl<K> AcceptedUdp<K> {
+impl<K, V> AcceptedUdp<K, V> {
     pub(crate) fn new(
-        recv: tokio::sync::mpsc::Receiver<Packet>,
+        recv: tokio::sync::mpsc::Receiver<V>,
         udp: Arc<UdpSocket>,
         peer: SocketAddr,
         last_sent: SharedClone<Instant>,
@@ -167,7 +165,7 @@ impl<K> AcceptedUdp<K> {
         self.udp.try_send_to(buf, self.peer)
     }
 
-    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<Packet> {
+    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
         &mut self.recv
     }
 }
@@ -184,7 +182,8 @@ mod tests {
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = udp.local_addr().unwrap();
-        let mut listener = UdpListener::new_socket_addr(udp, idle_timeout, dispatcher_buffer_size);
+        let mut listener =
+            UdpListener::new_identity_dispatch(udp, idle_timeout, dispatcher_buffer_size);
         let send_msg_1 = b"hello";
         let send_msg_2 = b"world";
         let client_recv_msg = Arc::new(tokio::sync::Notify::new());
