@@ -16,7 +16,7 @@ pub const BUFFER_LENGTH: usize = 2_usize.pow(16);
 
 pub type Packet = LinearOwnedReusable<BytesMut>;
 
-pub type Dispatch<K, V> = Arc<dyn Fn(SocketAddr, Packet) -> (K, V) + Sync + Send + 'static>;
+pub type Dispatch<K, V> = Arc<dyn Fn(SocketAddr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
 pub struct UdpListener<K, V> {
     udp: Arc<UdpSocket>,
@@ -31,7 +31,7 @@ impl UdpListener<SocketAddr, Packet> {
         idle_timeout: Duration,
         dispatcher_buffer_size: NonZeroUsize,
     ) -> Self {
-        let dispatch = |addr: SocketAddr, packet: Packet| (addr, packet);
+        let dispatch = |addr: SocketAddr, packet: Packet| Some((addr, packet));
         UdpListener::new(
             udp,
             idle_timeout,
@@ -76,7 +76,9 @@ where
                 continue;
             }
 
-            let (key, mut value) = (self.dispatch)(addr, buf);
+            let Some((key, mut value)) = (self.dispatch)(addr, buf) else {
+                continue;
+            };
 
             if let Some(tx) = self.accepted.get(&key) {
                 let Err(e) = tx.try_send(value) else {
