@@ -16,17 +16,36 @@ pub const BUFFER_LENGTH: usize = 2_usize.pow(16);
 
 pub type Packet = LinearOwnedReusable<BytesMut>;
 
-pub struct UdpListener {
+pub type DispatchKey<K> = Arc<dyn Fn(SocketAddr, &Packet) -> K + Sync + Send + 'static>;
+
+pub struct UdpListener<K> {
     udp: Arc<UdpSocket>,
-    accepted: ExpiringHashMap<SocketAddr, tokio::sync::mpsc::Sender<Packet>>,
+    accepted: ExpiringHashMap<K, tokio::sync::mpsc::Sender<Packet>>,
     buf_pool: Arc<LinearObjectPool<BytesMut>>,
     dispatcher_buffer_size: NonZeroUsize,
+    dispatch_key: DispatchKey<K>,
 }
-impl UdpListener {
+impl UdpListener<SocketAddr> {
+    pub fn new_socket_addr(
+        udp: UdpSocket,
+        idle_timeout: Duration,
+        dispatcher_buffer_size: NonZeroUsize,
+    ) -> Self {
+        let dispatch_key = |addr: SocketAddr, _: &Packet| addr;
+        UdpListener::new(
+            udp,
+            idle_timeout,
+            dispatcher_buffer_size,
+            Arc::new(dispatch_key),
+        )
+    }
+}
+impl<K> UdpListener<K> {
     pub fn new(
         udp: UdpSocket,
         idle_timeout: Duration,
         dispatcher_buffer_size: NonZeroUsize,
+        dispatch_key: DispatchKey<K>,
     ) -> Self {
         let accepted = ExpiringHashMap::new(idle_timeout);
         let buf_pool = Arc::new(LinearObjectPool::new(
@@ -38,13 +57,18 @@ impl UdpListener {
             accepted,
             buf_pool,
             dispatcher_buffer_size,
+            dispatch_key,
         }
     }
-
+}
+impl<K> UdpListener<K>
+where
+    K: Clone + core::hash::Hash + Eq,
+{
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn accept(&mut self) -> std::io::Result<AcceptedUdp> {
+    pub async fn accept(&mut self) -> std::io::Result<AcceptedUdp<K>> {
         let mut buf = self.buf_pool.pull_owned();
         loop {
             let (n, addr) = self.udp.recv_buf_from(&mut *buf).await?;
@@ -52,7 +76,9 @@ impl UdpListener {
                 continue;
             }
 
-            if let Some(tx) = self.accepted.get(&addr) {
+            let key = (self.dispatch_key)(addr, &buf);
+
+            if let Some(tx) = self.accepted.get(&key) {
                 let Err(e) = tx.try_send(buf) else {
                     buf = self.buf_pool.pull_owned();
                     continue;
@@ -69,17 +95,22 @@ impl UdpListener {
             let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
             tx.try_send(buf).unwrap();
             let shared_instant = SharedClone::new(Instant::now());
-            self.accepted.insert(addr, tx, shared_instant.clone());
+            self.accepted
+                .insert(key.clone(), tx, shared_instant.clone());
             return Ok(AcceptedUdp::new(
                 rx,
                 Arc::clone(&self.udp),
                 addr,
                 shared_instant,
+                key,
             ));
         }
     }
 }
-impl core::fmt::Debug for UdpListener {
+impl<K> core::fmt::Debug for UdpListener<K>
+where
+    K: core::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpListener")
             .field("udp", &self.udp)
@@ -90,25 +121,32 @@ impl core::fmt::Debug for UdpListener {
 }
 
 #[derive(Debug)]
-pub struct AcceptedUdp {
+pub struct AcceptedUdp<K> {
     recv: tokio::sync::mpsc::Receiver<Packet>,
     udp: Arc<UdpSocket>,
     peer: SocketAddr,
     last_sent: SharedClone<Instant>,
+    dispatch_key: K,
 }
-impl AcceptedUdp {
+impl<K> AcceptedUdp<K> {
     pub(crate) fn new(
         recv: tokio::sync::mpsc::Receiver<Packet>,
         udp: Arc<UdpSocket>,
         peer: SocketAddr,
         last_sent: SharedClone<Instant>,
+        dispatch_key: K,
     ) -> Self {
         Self {
             recv,
             udp,
             peer,
             last_sent,
+            dispatch_key,
         }
+    }
+
+    pub fn dispatch_key(&self) -> &K {
+        &self.dispatch_key
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -146,7 +184,7 @@ mod tests {
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = udp.local_addr().unwrap();
-        let mut listener = UdpListener::new(udp, idle_timeout, dispatcher_buffer_size);
+        let mut listener = UdpListener::new_socket_addr(udp, idle_timeout, dispatcher_buffer_size);
         let send_msg_1 = b"hello";
         let send_msg_2 = b"world";
         let client_recv_msg = Arc::new(tokio::sync::Notify::new());

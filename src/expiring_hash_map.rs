@@ -65,7 +65,7 @@ impl<K: Eq + core::hash::Hash + Clone, V> ExpiringHashMap<K, V> {
     pub fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
-        Q: ?Sized + Eq + std::hash::Hash,
+        Q: ?Sized + Eq + core::hash::Hash,
     {
         self.cleanup();
         match self.hash_map.get_mut(key) {
