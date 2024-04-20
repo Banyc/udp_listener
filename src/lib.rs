@@ -52,7 +52,8 @@ impl<K, V> UdpListener<K, V> {
 }
 impl<K, V> UdpListener<K, V>
 where
-    K: Clone + core::hash::Hash + Eq,
+    K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
+    V: Sync + Send + 'static,
 {
     /// # Cancel safety
     ///
@@ -89,11 +90,23 @@ where
 
             drop(accepted);
 
-            return Ok(AcceptedUdp {
+            let close_token = AcceptedUdpCloseToken {
+                dispatch_key: key.clone(),
                 accepted: self.accepted.clone(),
+            };
+            let close_token = Arc::new(close_token);
+            let read = AcceptedUdpRead {
                 recv: rx,
+                _close_token: close_token.clone(),
+            };
+            let write = AcceptedUdpWrite {
                 udp: Arc::clone(&self.udp),
                 peer: addr,
+                _close_token: close_token,
+            };
+            return Ok(AcceptedUdp {
+                read,
+                write,
                 dispatch_key: key,
             });
         }
@@ -112,24 +125,89 @@ where
     }
 }
 
-pub struct AcceptedUdp<K, V>
+trait StaticDrop: Sync + Send + 'static {}
+impl<K, V> StaticDrop for AcceptedUdpCloseToken<K, V>
+where
+    K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
+    V: Sync + Send + 'static,
+{
+}
+
+struct AcceptedUdpCloseToken<K, V>
 where
     K: Clone + core::hash::Hash + Eq,
 {
+    dispatch_key: K,
     accepted: AcceptedMap<K, V>,
-    recv: tokio::sync::mpsc::Receiver<V>,
-    udp: Arc<UdpSocket>,
-    peer: SocketAddr,
+}
+impl<K, V> Drop for AcceptedUdpCloseToken<K, V>
+where
+    K: Clone + core::hash::Hash + Eq,
+{
+    fn drop(&mut self) {
+        let mut accepted = self.accepted.lock().unwrap();
+        accepted.remove(&self.dispatch_key);
+    }
+}
+impl<K, V> core::fmt::Debug for AcceptedUdpCloseToken<K, V>
+where
+    K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptedUdpCloseToken")
+            .field("dispatch_key", &self.dispatch_key)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct AcceptedUdp<K, V> {
+    read: AcceptedUdpRead<V>,
+    write: AcceptedUdpWrite,
     dispatch_key: K,
 }
-impl<K, V> AcceptedUdp<K, V>
-where
-    K: Clone + core::hash::Hash + Eq,
-{
+impl<K, V> AcceptedUdp<K, V> {
+    pub fn read(&mut self) -> &mut AcceptedUdpRead<V> {
+        &mut self.read
+    }
+
+    pub fn write(&self) -> &AcceptedUdpWrite {
+        &self.write
+    }
+
     pub fn dispatch_key(&self) -> &K {
         &self.dispatch_key
     }
 
+    pub fn split(self) -> (AcceptedUdpRead<V>, AcceptedUdpWrite) {
+        (self.read, self.write)
+    }
+}
+
+pub struct AcceptedUdpRead<V> {
+    recv: tokio::sync::mpsc::Receiver<V>,
+    _close_token: Arc<dyn StaticDrop>,
+}
+impl<V> AcceptedUdpRead<V> {
+    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
+        &mut self.recv
+    }
+}
+impl<V> core::fmt::Debug for AcceptedUdpRead<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptedUdpRead")
+            .field("recv.len()", &self.recv.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct AcceptedUdpWrite {
+    udp: Arc<UdpSocket>,
+    peer: SocketAddr,
+    _close_token: Arc<dyn StaticDrop>,
+}
+impl AcceptedUdpWrite {
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.udp.local_addr()
     }
@@ -145,30 +223,12 @@ where
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.udp.try_send_to(buf, self.peer)
     }
-
-    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
-        &mut self.recv
-    }
 }
-impl<K, V> Drop for AcceptedUdp<K, V>
-where
-    K: Clone + core::hash::Hash + Eq,
-{
-    fn drop(&mut self) {
-        let mut accepted = self.accepted.lock().unwrap();
-        accepted.remove(&self.dispatch_key);
-    }
-}
-impl<K, V> core::fmt::Debug for AcceptedUdp<K, V>
-where
-    K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
-{
+impl core::fmt::Debug for AcceptedUdpWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcceptedUdp")
+        f.debug_struct("AcceptedUdpWrite")
             .field("udp", &self.udp)
             .field("peer", &self.peer)
-            .field("dispatch_key", &self.dispatch_key)
-            .field("recv.len()", &self.recv.len())
             .finish()
     }
 }
@@ -196,9 +256,9 @@ mod tests {
             async move {
                 let mut client = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let msg = client.recv().recv().await.unwrap();
+                    let msg = client.read().recv().recv().await.unwrap();
                     assert_eq!(msg.as_ref(), send_msg_1);
-                    let msg = client.recv().recv().await.unwrap();
+                    let msg = client.read().recv().recv().await.unwrap();
                     assert_eq!(msg.as_ref(), send_msg_2);
                     drop(client);
                     client_recv_msg.notify_waiters();
