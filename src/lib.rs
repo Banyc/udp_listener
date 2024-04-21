@@ -160,7 +160,6 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct AcceptedUdp<K, V> {
     read: AcceptedUdpRead<V>,
     write: AcceptedUdpWrite,
@@ -181,6 +180,15 @@ impl<K, V> AcceptedUdp<K, V> {
 
     pub fn split(self) -> (AcceptedUdpRead<V>, AcceptedUdpWrite) {
         (self.read, self.write)
+    }
+}
+impl<K: core::fmt::Debug, V> core::fmt::Debug for AcceptedUdp<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptedUdp")
+            .field("read", &self.read)
+            .field("write", &self.write)
+            .field("dispatch_key", &self.dispatch_key)
+            .finish()
     }
 }
 
