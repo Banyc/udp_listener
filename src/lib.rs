@@ -55,6 +55,10 @@ where
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
+    /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
+    ///
+    /// You should keep this method in a loop.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
