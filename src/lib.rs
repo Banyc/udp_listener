@@ -64,7 +64,7 @@ where
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
-    /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
+    /// Side-effect: This method also dispatches packets to all the accepted sub-connections.
     ///
     /// You should keep this method in a loop.
     ///
@@ -215,6 +215,7 @@ where
     }
 }
 
+/// A sub-connection derived from a UDP listener
 pub struct Conn<K, V> {
     read: ConnRead<V>,
     write: ConnWrite,
