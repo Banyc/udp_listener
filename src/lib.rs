@@ -44,7 +44,7 @@ impl<K, V> UdpListener<K, V> {
         dispatch: Dispatch<K, V>,
     ) -> Self {
         let pkt_buf_pool = ArcObjectPool::new(
-            usize::try_from(u32::MAX).unwrap(),
+            None,
             OBJ_POOL_SHARDS,
             || BytesMut::with_capacity(BUFFER_LENGTH),
             |buf| buf.clear(),
