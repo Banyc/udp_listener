@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use primitive::obj_pool::{ArcObjectPool, ObjectScoped};
+use primitive::arena::obj_pool::{ArcObjectPool, ObjectScoped};
 use tokio::net::UdpSocket;
 
 pub const BUFFER_LENGTH: usize = 2_usize.pow(16);
