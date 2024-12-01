@@ -13,7 +13,8 @@ const OBJ_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(4) };
 
 pub type Packet = ObjScoped<BytesMut>;
 
-pub type Dispatch<Addr, K, V> = Arc<dyn Fn(Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
+pub type Dispatch<Addr, K, V> =
+    Arc<dyn Fn(&Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
 type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
 
@@ -32,10 +33,11 @@ where
 impl<Utp> UtpListener<Utp, Utp::ProtocolAddress, Packet>
 where
     Utp: UnreliableTransmit,
+    Utp::ProtocolAddress: Clone,
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(rtp: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
-        let dispatch = |addr: Utp::ProtocolAddress, packet: Packet| Some((addr, packet));
+        let dispatch = |addr: &Utp::ProtocolAddress, packet: Packet| Some((addr.clone(), packet));
         UtpListener::new(rtp, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
@@ -91,7 +93,7 @@ where
                 continue;
             }
 
-            let Some((key, mut value)) = (self.dispatch)(addr, pkt_buf) else {
+            let Some((key, mut value)) = (self.dispatch)(&addr, pkt_buf) else {
                 continue;
             };
 
@@ -294,7 +296,7 @@ where
     fn clone(&self) -> Self {
         Self {
             utp: Arc::clone(&self.utp),
-            peer: self.peer,
+            peer: self.peer.clone(),
             _close_token: Arc::clone(&self._close_token),
         }
     }
@@ -307,19 +309,19 @@ where
         self.utp.local_addr()
     }
     pub fn peer_addr(&self) -> Utp::ProtocolAddress {
-        match self.peer {
-            Some(x) => x,
+        match &self.peer {
+            Some(x) => x.clone(),
             None => self.utp.peer_addr().unwrap(),
         }
     }
     pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.peer {
+        match &self.peer {
             Some(peer) => self.utp.send_to(buf, peer).await,
             None => self.utp.send(buf).await,
         }
     }
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.peer {
+        match &self.peer {
             Some(peer) => self.utp.try_send_to(buf, peer),
             None => self.utp.try_send(buf),
         }
@@ -339,7 +341,7 @@ where
 }
 
 pub trait UnreliableTransmit {
-    type ProtocolAddress: Copy;
+    type ProtocolAddress: Clone;
     fn local_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
     fn peer_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
     fn recv_buf(&self, buf: &mut impl BufMut) -> impl Future<Output = std::io::Result<usize>>;
@@ -351,10 +353,10 @@ pub trait UnreliableTransmit {
     fn send_to(
         &self,
         buf: &[u8],
-        target: Self::ProtocolAddress,
+        target: &Self::ProtocolAddress,
     ) -> impl Future<Output = std::io::Result<usize>>;
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
-    fn try_send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize>;
+    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize>;
 }
 impl UnreliableTransmit for UdpSocket {
     type ProtocolAddress = SocketAddr;
@@ -376,14 +378,14 @@ impl UnreliableTransmit for UdpSocket {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf).await
     }
-    async fn send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
         self.send_to(buf, target).await
     }
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.try_send(buf)
     }
-    fn try_send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize> {
-        self.try_send_to(buf, target)
+    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
+        self.try_send_to(buf, *target)
     }
 }
 
@@ -446,7 +448,7 @@ mod tests {
         let key = 42;
         let msg = b"hello world";
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
-        let dispatch = |_addr: SocketAddr, mut packet: Packet| -> Option<(u8, Packet)> {
+        let dispatch = |_addr: &SocketAddr, mut packet: Packet| -> Option<(u8, Packet)> {
             let mut key_buf = [0; 1];
             let mut rdr = std::io::Cursor::new(packet.as_ref());
             rdr.read_exact(&mut key_buf).ok()?;
