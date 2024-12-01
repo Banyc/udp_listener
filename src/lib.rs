@@ -1,57 +1,62 @@
+use core::{future::Future, net::SocketAddr, num::NonZeroUsize};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
-    num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
 
-use bytes::BytesMut;
-use primitive::arena::obj_pool::{ArcObjectPool, ObjectScoped};
+use bytes::{BufMut, BytesMut};
+use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
 use tokio::net::UdpSocket;
 
-pub const BUFFER_LENGTH: usize = 2_usize.pow(16);
+pub const PACKET_BUFFER_LENGTH: usize = 2_usize.pow(16);
 const OBJ_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(4) };
 
-pub type Packet = ObjectScoped<BytesMut>;
+pub type Packet = ObjScoped<BytesMut>;
 
-pub type Dispatch<K, V> = Arc<dyn Fn(SocketAddr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
+pub type Dispatch<Addr, K, V> = Arc<dyn Fn(Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
 type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
 
-/// Manage user-defined sub-connections under a UDP socket.
-pub struct UdpListener<K, V> {
-    is_udp_connected: bool,
-    udp: Arc<UdpSocket>,
+/// Manage user-defined sub-connections under a unreliable transmission socket.
+pub struct UtpListener<Utp, K, V>
+where
+    Utp: UnreliableTransmit,
+{
+    is_utp_connected: bool,
+    utp: Arc<Utp>,
     conn_table: ConnTable<K, V>,
-    pkt_buf_pool: ArcObjectPool<BytesMut>,
+    pkt_buf_pool: ArcObjPool<BytesMut>,
     dispatcher_buffer_size: NonZeroUsize,
-    dispatch: Dispatch<K, V>,
+    dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
 }
-impl UdpListener<SocketAddr, Packet> {
+impl<Utp> UtpListener<Utp, Utp::ProtocolAddress, Packet>
+where
+    Utp: UnreliableTransmit,
+{
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
-    pub fn new_identity_dispatch(
-        unconnected_udp: UdpSocket,
-        dispatcher_buffer_size: NonZeroUsize,
-    ) -> Self {
-        let dispatch = |addr: SocketAddr, packet: Packet| Some((addr, packet));
-        UdpListener::new(unconnected_udp, dispatcher_buffer_size, Arc::new(dispatch))
+    pub fn new_identity_dispatch(rtp: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
+        let dispatch = |addr: Utp::ProtocolAddress, packet: Packet| Some((addr, packet));
+        UtpListener::new(rtp, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
-impl<K, V> UdpListener<K, V> {
+impl<Utp, K, V> UtpListener<Utp, K, V>
+where
+    Utp: UnreliableTransmit,
+{
     pub fn new(
-        udp: UdpSocket,
+        utp: Utp,
         dispatcher_buffer_size: NonZeroUsize,
-        dispatch: Dispatch<K, V>,
+        dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
     ) -> Self {
-        let pkt_buf_pool = ArcObjectPool::new(
+        let pkt_buf_pool = ArcObjPool::new(
             None,
             OBJ_POOL_SHARDS,
-            || BytesMut::with_capacity(BUFFER_LENGTH),
+            || BytesMut::with_capacity(PACKET_BUFFER_LENGTH),
             |buf| buf.clear(),
         );
         Self {
-            is_udp_connected: udp.peer_addr().is_ok(),
-            udp: Arc::new(udp),
+            is_utp_connected: utp.peer_addr().is_ok(),
+            utp: Arc::new(utp),
             conn_table: Arc::new(Mutex::new(HashMap::new())),
             pkt_buf_pool,
             dispatcher_buffer_size,
@@ -59,8 +64,9 @@ impl<K, V> UdpListener<K, V> {
         }
     }
 }
-impl<K, V> UdpListener<K, V>
+impl<Utp, K, V> UtpListener<Utp, K, V>
 where
+    Utp: UnreliableTransmit,
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
@@ -71,17 +77,17 @@ where
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn accept(&self) -> std::io::Result<Conn<K, V>> {
+    pub async fn accept(&self) -> std::io::Result<Conn<Utp, K, V>> {
         loop {
             let mut pkt_buf = self.pkt_buf_pool.take_scoped();
-            let (n, addr) = if self.is_udp_connected {
-                let n = self.udp.recv_buf(&mut *pkt_buf).await?;
-                let addr = self.udp.peer_addr()?;
+            let (n, addr) = if self.is_utp_connected {
+                let n = self.utp.recv_buf(&mut *pkt_buf).await?;
+                let addr = self.utp.peer_addr()?;
                 (n, addr)
             } else {
-                self.udp.recv_buf_from(&mut *pkt_buf).await?
+                self.utp.recv_buf_from(&mut *pkt_buf).await?
             };
-            if n == BUFFER_LENGTH {
+            if n == PACKET_BUFFER_LENGTH {
                 continue;
             }
 
@@ -113,16 +119,16 @@ where
         }
     }
 
-    /// This method is intended to open a sub-connection under a connected UDP socket.
+    /// This method is intended to open a sub-connection under a connected unreliable transmission socket.
     ///
     /// You still need to put [`Self::accept()`] in a loop to drive the packet dispatch among the sub-connections.
     ///
     /// Return [`None`] if either:
     ///
-    /// - The UDP socket is unconnected;
+    /// - The unreliable transmission socket is unconnected;
     /// - The `conn_key` has already been registered in the connection table.
-    pub fn open(&self, conn_key: K) -> Option<Conn<K, V>> {
-        let peer_addr = self.udp.peer_addr().ok()?;
+    pub fn open(&self, conn_key: K) -> Option<Conn<Utp, K, V>> {
+        let peer_addr = self.utp.peer_addr().ok()?;
         let mut conn_table = self.conn_table.lock().unwrap();
         if conn_table.get(&conn_key).is_some() {
             return None;
@@ -133,13 +139,13 @@ where
         Some(self.wrap_handle(conn_key, rx, peer_addr))
     }
 
-    /// Pass in `peer_addr` as [`None`] iff the underlying UDP socket is connected.
+    /// Pass in `peer_addr` as [`None`] iff the underlying unreliable transmission socket is connected.
     fn wrap_handle(
         &self,
         conn_key: K,
         rx: tokio::sync::mpsc::Receiver<V>,
-        peer_addr: SocketAddr,
-    ) -> Conn<K, V> {
+        peer_addr: Utp::ProtocolAddress,
+    ) -> Conn<Utp, K, V> {
         let close_token = ConnCloseToken {
             conn_key: conn_key.clone(),
             conn_table: self.conn_table.clone(),
@@ -149,14 +155,14 @@ where
             recv: rx,
             _close_token: close_token.clone(),
         };
-        let udp_to = if self.is_udp_connected {
-            assert_eq!(peer_addr, self.udp.peer_addr().unwrap());
+        let udp_to = if self.is_utp_connected {
+            // assert_eq!(peer_addr, self.utp.peer_addr().unwrap());
             None
         } else {
             Some(peer_addr)
         };
         let write = ConnWrite {
-            udp: Arc::clone(&self.udp),
+            utp: Arc::clone(&self.utp),
             peer: udp_to,
             _close_token: close_token,
         };
@@ -167,13 +173,14 @@ where
         }
     }
 }
-impl<K, V> core::fmt::Debug for UdpListener<K, V>
+impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
 where
+    Utp: UnreliableTransmit + core::fmt::Debug,
     K: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpListener")
-            .field("udp", &self.udp)
+            .field("utp", &self.utp)
             .field("accepted", &self.conn_table)
             .field("dispatcher_buffer_size", &self.dispatcher_buffer_size)
             .finish()
@@ -209,37 +216,44 @@ where
     K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcceptedUdpCloseToken")
+        f.debug_struct("ConnCloseToken")
             .field("dispatch_key", &self.conn_key)
             .finish()
     }
 }
 
-/// A sub-connection derived from a UDP listener
-pub struct Conn<K, V> {
+/// A sub-connection derived from a unreliable transmission listener
+pub struct Conn<Utp, K, V>
+where
+    Utp: UnreliableTransmit,
+{
     read: ConnRead<V>,
-    write: ConnWrite,
+    write: ConnWrite<Utp>,
     conn_key: K,
 }
-impl<K, V> Conn<K, V> {
+impl<Utp, K, V> Conn<Utp, K, V>
+where
+    Utp: UnreliableTransmit,
+{
     pub fn read(&mut self) -> &mut ConnRead<V> {
         &mut self.read
     }
-
-    pub fn write(&self) -> &ConnWrite {
+    pub fn write(&self) -> &ConnWrite<Utp> {
         &self.write
     }
-
     pub fn conn_key(&self) -> &K {
         &self.conn_key
     }
-
-    pub fn split(self) -> (ConnRead<V>, ConnWrite) {
+    pub fn split(self) -> (ConnRead<V>, ConnWrite<Utp>) {
         (self.read, self.write)
     }
 }
-impl<K: core::fmt::Debug, V> core::fmt::Debug for Conn<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<Utp, K: core::fmt::Debug, V> core::fmt::Debug for Conn<Utp, K, V>
+where
+    Utp: UnreliableTransmit + core::fmt::Debug,
+    Utp::ProtocolAddress: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Conn")
             .field("read", &self.read)
             .field("write", &self.write)
@@ -258,51 +272,118 @@ impl<V> ConnRead<V> {
     }
 }
 impl<V> core::fmt::Debug for ConnRead<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConnRead")
             .field("recv.len()", &self.recv.len())
             .finish()
     }
 }
 
-#[derive(Clone)]
-pub struct ConnWrite {
-    udp: Arc<UdpSocket>,
-    peer: Option<SocketAddr>,
+pub struct ConnWrite<Utp>
+where
+    Utp: UnreliableTransmit,
+{
+    utp: Arc<Utp>,
+    peer: Option<Utp::ProtocolAddress>,
     _close_token: Arc<dyn StaticDrop>,
 }
-impl ConnWrite {
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.udp.local_addr()
-    }
-
-    pub fn peer_addr(&self) -> SocketAddr {
-        match self.peer {
-            Some(x) => x,
-            None => self.udp.peer_addr().unwrap(),
-        }
-    }
-
-    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.peer {
-            Some(peer) => self.udp.send_to(buf, peer).await,
-            None => self.udp.send(buf).await,
-        }
-    }
-
-    pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.peer {
-            Some(peer) => self.udp.try_send_to(buf, peer),
-            None => self.udp.try_send(buf),
+impl<Utp> Clone for ConnWrite<Utp>
+where
+    Utp: UnreliableTransmit,
+{
+    fn clone(&self) -> Self {
+        Self {
+            utp: Arc::clone(&self.utp),
+            peer: self.peer,
+            _close_token: Arc::clone(&self._close_token),
         }
     }
 }
-impl core::fmt::Debug for ConnWrite {
+impl<Utp> ConnWrite<Utp>
+where
+    Utp: UnreliableTransmit,
+{
+    pub fn local_addr(&self) -> std::io::Result<Utp::ProtocolAddress> {
+        self.utp.local_addr()
+    }
+    pub fn peer_addr(&self) -> Utp::ProtocolAddress {
+        match self.peer {
+            Some(x) => x,
+            None => self.utp.peer_addr().unwrap(),
+        }
+    }
+    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.peer {
+            Some(peer) => self.utp.send_to(buf, peer).await,
+            None => self.utp.send(buf).await,
+        }
+    }
+    pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.peer {
+            Some(peer) => self.utp.try_send_to(buf, peer),
+            None => self.utp.try_send(buf),
+        }
+    }
+}
+impl<Utp> core::fmt::Debug for ConnWrite<Utp>
+where
+    Utp: UnreliableTransmit + core::fmt::Debug,
+    Utp::ProtocolAddress: core::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnWrite")
-            .field("udp", &self.udp)
+            .field("udp", &self.utp)
             .field("peer", &self.peer)
             .finish()
+    }
+}
+
+pub trait UnreliableTransmit {
+    type ProtocolAddress: Copy;
+    fn local_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
+    fn peer_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
+    fn recv_buf(&self, buf: &mut impl BufMut) -> impl Future<Output = std::io::Result<usize>>;
+    fn recv_buf_from(
+        &self,
+        buf: &mut impl BufMut,
+    ) -> impl Future<Output = std::io::Result<(usize, Self::ProtocolAddress)>>;
+    fn send(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<usize>>;
+    fn send_to(
+        &self,
+        buf: &[u8],
+        target: Self::ProtocolAddress,
+    ) -> impl Future<Output = std::io::Result<usize>>;
+    fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
+    fn try_send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize>;
+}
+impl UnreliableTransmit for UdpSocket {
+    type ProtocolAddress = SocketAddr;
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.local_addr()
+    }
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.peer_addr()
+    }
+    async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
+        self.recv_buf(buf).await
+    }
+    async fn recv_buf_from(
+        &self,
+        buf: &mut impl BufMut,
+    ) -> std::io::Result<(usize, Self::ProtocolAddress)> {
+        self.recv_buf_from(buf).await
+    }
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.send(buf).await
+    }
+    async fn send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize> {
+        self.send_to(buf, target).await
+    }
+    fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.try_send(buf)
+    }
+    fn try_send_to(&self, buf: &[u8], target: Self::ProtocolAddress) -> std::io::Result<usize> {
+        self.try_send_to(buf, target)
     }
 }
 
@@ -320,7 +401,7 @@ mod tests {
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = udp.local_addr().unwrap();
-        let listener = UdpListener::new_identity_dispatch(udp, dispatcher_buffer_size);
+        let listener = UtpListener::new_identity_dispatch(udp, dispatcher_buffer_size);
         let send_msg_1 = b"hello";
         let send_msg_2 = b"world";
         let client_recv_msg = Arc::new(tokio::sync::Notify::new());
@@ -376,13 +457,13 @@ mod tests {
 
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = server.local_addr().unwrap();
-        let server: UdpListener<u8, Packet> =
-            UdpListener::new(server, dispatcher_buffer_size, dispatch.clone());
+        let server: UtpListener<UdpSocket, u8, Packet> =
+            UtpListener::new(server, dispatcher_buffer_size, dispatch.clone());
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(listen_addr).await.unwrap();
-        let client: UdpListener<u8, Packet> =
-            UdpListener::new(client, dispatcher_buffer_size, dispatch.clone());
+        let client: UtpListener<UdpSocket, u8, Packet> =
+            UtpListener::new(client, dispatcher_buffer_size, dispatch.clone());
 
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
