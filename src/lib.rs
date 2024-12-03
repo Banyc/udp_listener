@@ -33,7 +33,6 @@ where
 impl<Utp> UtpListener<Utp, Utp::ProtocolAddress, Packet>
 where
     Utp: UnreliableTransmit,
-    Utp::ProtocolAddress: Clone,
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(rtp: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
@@ -100,14 +99,9 @@ where
             let mut conn_table = self.conn_table.lock().unwrap();
 
             if let Some(tx) = conn_table.get(&key) {
-                let Err(e) = tx.try_send(value) else {
-                    continue;
-                };
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        continue;
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(v) => value = v,
+                match tx.try_send(value) {
+                    Ok(_) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => value = v,
                 }
             }
 
