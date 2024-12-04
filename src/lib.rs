@@ -30,6 +30,19 @@ where
     dispatcher_buffer_size: NonZeroUsize,
     dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
 }
+impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
+where
+    Utp: UnreliableTransmit + core::fmt::Debug,
+    K: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UtpListener")
+            .field("utp", &self.utp)
+            .field("conn_table", &self.conn_table)
+            .field("dispatcher_buffer_size", &self.dispatcher_buffer_size)
+            .finish()
+    }
+}
 impl<Utp> UtpListener<Utp, Utp::ProtocolAddress, Packet>
 where
     Utp: UnreliableTransmit,
@@ -169,19 +182,6 @@ where
         }
     }
 }
-impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
-where
-    Utp: UnreliableTransmit + core::fmt::Debug,
-    K: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UdpListener")
-            .field("utp", &self.utp)
-            .field("accepted", &self.conn_table)
-            .field("dispatcher_buffer_size", &self.dispatcher_buffer_size)
-            .finish()
-    }
-}
 
 trait StaticDrop: Sync + Send + 'static {}
 impl<K, V> StaticDrop for ConnCloseToken<K, V>
@@ -198,6 +198,16 @@ where
     conn_key: K,
     conn_table: ConnTable<K, V>,
 }
+impl<K, V> core::fmt::Debug for ConnCloseToken<K, V>
+where
+    K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnCloseToken")
+            .field("conn_key", &self.conn_key)
+            .finish()
+    }
+}
 impl<K, V> Drop for ConnCloseToken<K, V>
 where
     K: Clone + core::hash::Hash + Eq,
@@ -205,16 +215,6 @@ where
     fn drop(&mut self) {
         let mut conn_table = self.conn_table.lock().unwrap();
         conn_table.remove(&self.conn_key);
-    }
-}
-impl<K, V> core::fmt::Debug for ConnCloseToken<K, V>
-where
-    K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnCloseToken")
-            .field("dispatch_key", &self.conn_key)
-            .finish()
     }
 }
 
@@ -226,6 +226,19 @@ where
     read: ConnRead<V>,
     write: ConnWrite<Utp>,
     conn_key: K,
+}
+impl<Utp, K: core::fmt::Debug, V> core::fmt::Debug for Conn<Utp, K, V>
+where
+    Utp: UnreliableTransmit + core::fmt::Debug,
+    Utp::ProtocolAddress: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Conn")
+            .field("read", &self.read)
+            .field("write", &self.write)
+            .field("conn_key", &self.conn_key)
+            .finish()
+    }
 }
 impl<Utp, K, V> Conn<Utp, K, V>
 where
@@ -244,34 +257,21 @@ where
         (self.read, self.write)
     }
 }
-impl<Utp, K: core::fmt::Debug, V> core::fmt::Debug for Conn<Utp, K, V>
-where
-    Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Conn")
-            .field("read", &self.read)
-            .field("write", &self.write)
-            .field("conn_key", &self.conn_key)
-            .finish()
-    }
-}
 
 pub struct ConnRead<V> {
     recv: tokio::sync::mpsc::Receiver<V>,
     _close_token: Arc<dyn StaticDrop>,
-}
-impl<V> ConnRead<V> {
-    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
-        &mut self.recv
-    }
 }
 impl<V> core::fmt::Debug for ConnRead<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConnRead")
             .field("recv.len()", &self.recv.len())
             .finish()
+    }
+}
+impl<V> ConnRead<V> {
+    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
+        &mut self.recv
     }
 }
 
@@ -282,6 +282,18 @@ where
     utp: Arc<Utp>,
     peer: Option<Utp::ProtocolAddress>,
     _close_token: Arc<dyn StaticDrop>,
+}
+impl<Utp> core::fmt::Debug for ConnWrite<Utp>
+where
+    Utp: UnreliableTransmit + core::fmt::Debug,
+    Utp::ProtocolAddress: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnWrite")
+            .field("utp", &self.utp)
+            .field("peer", &self.peer)
+            .finish()
+    }
 }
 impl<Utp> Clone for ConnWrite<Utp>
 where
@@ -319,18 +331,6 @@ where
             Some(peer) => self.utp.try_send_to(buf, peer),
             None => self.utp.try_send(buf),
         }
-    }
-}
-impl<Utp> core::fmt::Debug for ConnWrite<Utp>
-where
-    Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnWrite")
-            .field("udp", &self.utp)
-            .field("peer", &self.peer)
-            .finish()
     }
 }
 
