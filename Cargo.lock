@@ -325,6 +325,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio_udp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "udp_listener"
 version = "0.1.0"
 dependencies = [
@@ -332,6 +341,7 @@ dependencies = [
  "futures",
  "primitive",
  "tokio",
+ "tokio_udp",
 ]
 
 [[package]]
