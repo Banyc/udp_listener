@@ -1,6 +1,7 @@
 use core::{future::Future, net::SocketAddr, num::NonZeroUsize};
 use std::{
     collections::HashMap,
+    io::IoSlice,
     sync::{Arc, Mutex},
 };
 
@@ -326,6 +327,12 @@ where
             None => self.utp.send(buf).await,
         }
     }
+    pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        match &self.peer {
+            Some(peer) => self.utp.send_to_vectored(bufs, peer).await,
+            None => self.utp.send_vectored(bufs).await,
+        }
+    }
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         match &self.peer {
             Some(peer) => self.utp.try_send_to(buf, peer),
@@ -349,6 +356,45 @@ pub trait UnreliableTransmit {
         buf: &[u8],
         target: &Self::ProtocolAddress,
     ) -> impl Future<Output = std::io::Result<usize>>;
+    fn send_vectored(
+        &self,
+        bufs: &[IoSlice<'_>],
+    ) -> impl Future<Output = std::io::Result<usize>> {
+        async move {
+            match bufs.len() {
+                0 => Ok(0),
+                1 => self.send(&*bufs[0]).await,
+                _ => {
+                    let total = bufs.iter().map(|b| b.len()).sum();
+                    let mut buf = Vec::with_capacity(total);
+                    for b in bufs {
+                        buf.extend_from_slice(b);
+                    }
+                    self.send(&buf).await
+                }
+            }
+        }
+    }
+    fn send_to_vectored(
+        &self,
+        bufs: &[IoSlice<'_>],
+        target: &Self::ProtocolAddress,
+    ) -> impl Future<Output = std::io::Result<usize>> {
+        async move {
+            match bufs.len() {
+                0 => Ok(0),
+                1 => self.send_to(&*bufs[0], target).await,
+                _ => {
+                    let total = bufs.iter().map(|b| b.len()).sum();
+                    let mut buf = Vec::with_capacity(total);
+                    for b in bufs {
+                        buf.extend_from_slice(b);
+                    }
+                    self.send_to(&buf, target).await
+                }
+            }
+        }
+    }
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
     fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize>;
 }
