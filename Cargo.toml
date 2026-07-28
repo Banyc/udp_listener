@@ -1,11 +1,11 @@
 [package]
 name = "udp_listener"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 bytes = "1"
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.55" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
 tokio = { version = "1", features = [
     "bytes",
     "io-util",
@@ -13,11 +13,11 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.1" }
+tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.2" }
 
 [dev-dependencies]
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-[patch."https://github.com/Banyc/tokio_udp.git"]
-tokio_udp = { path = "../tokio_udp" }
+# [patch."https://github.com/Banyc/tokio_udp.git"]
+# tokio_udp = { path = "../tokio_udp" }
