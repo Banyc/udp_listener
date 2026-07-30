@@ -534,7 +534,7 @@ mod tests {
         let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        client.connect(listen_addr).unwrap();
+        client.connect(listen_addr).await.unwrap();
         client.send(send_msg_1).await.unwrap();
         client.send(send_msg_2).await.unwrap();
         client_recv_msg.await;
@@ -572,7 +572,7 @@ mod tests {
         let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        client.connect(listen_addr).unwrap();
+        client.connect(listen_addr).await.unwrap();
         let client: UtpListener<tokio_udp::UdpSocket, u8, Packet> =
             UtpListener::new(client, dispatcher_buffer_size, dispatch.clone());
 
