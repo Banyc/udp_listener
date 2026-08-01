@@ -66,7 +66,10 @@ where
             None,
             OBJ_POOL_SHARDS,
             || BytesMut::with_capacity(PACKET_BUFFER_LENGTH),
-            |buf| buf.clear(),
+            |buf| {
+                buf.clear();
+                buf.reserve(PACKET_BUFFER_LENGTH);
+            },
         );
         Self {
             is_utp_connected: utp.peer_addr().is_ok(),
@@ -120,11 +123,11 @@ where
 
             let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
             tx.try_send(value).unwrap();
-            conn_table.insert(key.clone(), tx);
+            conn_table.insert(key.clone(), tx.clone());
 
             drop(conn_table);
 
-            return Ok(self.wrap_handle(key, rx, addr));
+            return Ok(self.wrap_handle(key, tx, rx, addr));
         }
     }
 
@@ -143,21 +146,23 @@ where
             return None;
         }
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
-        conn_table.insert(conn_key.clone(), tx);
+        conn_table.insert(conn_key.clone(), tx.clone());
         drop(conn_table);
-        Some(self.wrap_handle(conn_key, rx, peer_addr))
+        Some(self.wrap_handle(conn_key, tx, rx, peer_addr))
     }
 
     /// Pass in `peer_addr` as [`None`] iff the underlying unreliable transmission socket is connected.
     fn wrap_handle(
         &self,
         conn_key: K,
+        tx: tokio::sync::mpsc::Sender<V>,
         rx: tokio::sync::mpsc::Receiver<V>,
         peer_addr: Utp::ProtocolAddress,
     ) -> Conn<Utp, K, V> {
         let close_token = ConnCloseToken {
             conn_key: conn_key.clone(),
             conn_table: self.conn_table.clone(),
+            tx,
         };
         let close_token = Arc::new(close_token);
         let read = ConnRead {
@@ -197,6 +202,7 @@ where
 {
     conn_key: K,
     conn_table: ConnTable<K, V>,
+    tx: tokio::sync::mpsc::Sender<V>,
 }
 impl<K, V> core::fmt::Debug for ConnCloseToken<K, V>
 where
@@ -214,7 +220,12 @@ where
 {
     fn drop(&mut self) {
         let mut conn_table = self.conn_table.lock().unwrap();
-        conn_table.remove(&self.conn_key);
+        let is_still_ours = conn_table
+            .get(&self.conn_key)
+            .is_some_and(|tx| tx.same_channel(&self.tx));
+        if is_still_ours {
+            conn_table.remove(&self.conn_key);
+        }
     }
 }
 
@@ -500,6 +511,49 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_pooled_buffer_does_not_shrink_across_reuses() {
+        const HEADER_LEN: usize = 8_000;
+        const PAYLOAD_LEN: usize = 8_192;
+        const BODY_LEN: usize = PAYLOAD_LEN - HEADER_LEN;
+        let dispatcher_buffer_size = NonZeroUsize::new(64).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        let dispatch = |addr: &SocketAddr, mut pkt: Packet| {
+            let header_len = HEADER_LEN.min(pkt.len());
+            pkt.advance(header_len);
+            Some((*addr, pkt))
+        };
+        let listener = UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+        let payload = vec![0xABu8; PAYLOAD_LEN];
+        client.send(&payload).await.unwrap();
+        let mut conn = listener.accept().await.unwrap();
+        assert_eq!(conn.read().recv().recv().await.unwrap().len(), BODY_LEN);
+        for i in 0..64 {
+            client.send(&payload).await.unwrap();
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = listener.accept() => None,
+                    pkt = conn.read().recv().recv() => pkt,
+                }
+            })
+            .await
+            .expect("the packet was never dispatched")
+            .expect("the connection was dropped");
+            assert_eq!(
+                pkt.len(),
+                BODY_LEN,
+                "packet {i} was truncated: the pooled buffer shrank"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_listener() {
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
         let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
@@ -546,6 +600,39 @@ mod tests {
 
         client.send(send_msg_1).await.unwrap();
         second_accept.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_connection_does_not_evict_its_successor() {
+        let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        let listener = UtpListener::new_identity_dispatch(udp, dispatcher_buffer_size);
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+        client.send(b"a").await.unwrap();
+        let (read_a, write_a) = listener.accept().await.unwrap().split();
+        drop(read_a);
+        client.send(b"b").await.unwrap();
+        let mut conn_b = listener.accept().await.unwrap();
+        assert_eq!(conn_b.read().recv().recv().await.unwrap().as_ref(), b"b");
+        drop(write_a);
+        client.send(b"c").await.unwrap();
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = listener.accept() => None,
+                msg = conn_b.read().recv().recv() => msg,
+            }
+        })
+        .await
+        .expect("neither a dispatch nor an accept happened");
+        let dispatched = dispatched
+            .expect("the successor was evicted: its packet accepted a third connection instead");
+        assert_eq!(dispatched.as_ref(), b"c");
     }
 
     #[tokio::test(flavor = "multi_thread")]
