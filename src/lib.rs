@@ -142,7 +142,7 @@ where
     pub fn open(&self, conn_key: K) -> Option<Conn<Utp, K, V>> {
         let peer_addr = self.utp.peer_addr().ok()?;
         let mut conn_table = self.conn_table.lock().unwrap();
-        if conn_table.get(&conn_key).is_some() {
+        if conn_table.get(&conn_key).is_some_and(|tx| !tx.is_closed()) {
             return None;
         }
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
@@ -633,6 +633,42 @@ mod tests {
         let dispatched = dispatched
             .expect("the successor was evicted: its packet accepted a third connection instead");
         assert_eq!(dispatched.as_ref(), b"c");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_connection_does_not_block_reopening_its_key() {
+        const KEY: u8 = 7;
+        let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        udp.connect(peer.local_addr().unwrap()).await.unwrap();
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((KEY, pkt));
+        let listener: UtpListener<tokio_udp::UdpSocket, u8, Packet> =
+            UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
+        let (read, write) = listener.open(KEY).expect("the key was free").split();
+        drop(read);
+        let reopened = listener
+            .open(KEY)
+            .expect("a dead connection's leftover entry refused the key");
+        let (mut reopened_read, _reopened_write) = reopened.split();
+        peer.send_to_vectored(&[IoSlice::new(b"x")], &listener.utp.local_addr().unwrap())
+            .await
+            .unwrap();
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = listener.accept() => None,
+                msg = reopened_read.recv().recv() => msg,
+            }
+        })
+        .await
+        .expect("neither a dispatch nor an accept happened")
+        .expect("the reopened connection never got the packet");
+        assert_eq!(dispatched.as_ref(), b"x");
+        drop(write);
     }
 
     #[tokio::test(flavor = "multi_thread")]
