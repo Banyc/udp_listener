@@ -1,12 +1,20 @@
-use core::{future::Future, net::SocketAddr, num::NonZeroUsize};
+use core::num::NonZeroUsize;
+#[cfg(test)]
+use core::net::SocketAddr;
 use std::{
     collections::HashMap,
-    io::IoSlice,
     sync::{Arc, Mutex},
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
+
+mod conn;
+mod transmit;
+
+use conn::ConnCloseToken;
+pub use conn::{Conn, ConnRead, ConnWrite};
+pub use transmit::UnreliableTransmit;
 
 pub const PACKET_BUFFER_LENGTH: usize = 2_usize.pow(16);
 const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
@@ -16,7 +24,7 @@ pub type Packet = ObjScoped<BytesMut>;
 pub type Dispatch<Addr, K, V> =
     Arc<dyn Fn(&Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
-type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
+pub(crate) type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
 
 /// Manage user-defined sub-connections under a unreliable transmission socket.
 pub struct UtpListener<Utp, K, V>
@@ -188,319 +196,6 @@ where
     }
 }
 
-trait StaticDrop: Sync + Send + 'static {}
-impl<K, V> StaticDrop for ConnCloseToken<K, V>
-where
-    K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
-    V: Sync + Send + 'static,
-{
-}
-
-struct ConnCloseToken<K, V>
-where
-    K: Clone + core::hash::Hash + Eq,
-{
-    conn_key: K,
-    conn_table: ConnTable<K, V>,
-    tx: tokio::sync::mpsc::Sender<V>,
-}
-impl<K, V> core::fmt::Debug for ConnCloseToken<K, V>
-where
-    K: core::fmt::Debug + Clone + core::hash::Hash + Eq,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnCloseToken")
-            .field("conn_key", &self.conn_key)
-            .finish()
-    }
-}
-impl<K, V> Drop for ConnCloseToken<K, V>
-where
-    K: Clone + core::hash::Hash + Eq,
-{
-    fn drop(&mut self) {
-        let mut conn_table = self.conn_table.lock().unwrap();
-        let is_still_ours = conn_table
-            .get(&self.conn_key)
-            .is_some_and(|tx| tx.same_channel(&self.tx));
-        if is_still_ours {
-            conn_table.remove(&self.conn_key);
-        }
-    }
-}
-
-/// A sub-connection derived from a unreliable transmission listener
-pub struct Conn<Utp, K, V>
-where
-    Utp: UnreliableTransmit,
-{
-    read: ConnRead<V>,
-    write: ConnWrite<Utp>,
-    conn_key: K,
-}
-impl<Utp, K: core::fmt::Debug, V> core::fmt::Debug for Conn<Utp, K, V>
-where
-    Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Conn")
-            .field("read", &self.read)
-            .field("write", &self.write)
-            .field("conn_key", &self.conn_key)
-            .finish()
-    }
-}
-impl<Utp, K, V> Conn<Utp, K, V>
-where
-    Utp: UnreliableTransmit,
-{
-    pub fn read(&mut self) -> &mut ConnRead<V> {
-        &mut self.read
-    }
-    pub fn write(&self) -> &ConnWrite<Utp> {
-        &self.write
-    }
-    pub fn conn_key(&self) -> &K {
-        &self.conn_key
-    }
-    pub fn split(self) -> (ConnRead<V>, ConnWrite<Utp>) {
-        (self.read, self.write)
-    }
-}
-
-pub struct ConnRead<V> {
-    recv: tokio::sync::mpsc::Receiver<V>,
-    _close_token: Arc<dyn StaticDrop>,
-}
-impl<V> core::fmt::Debug for ConnRead<V> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ConnRead")
-            .field("recv.len()", &self.recv.len())
-            .finish()
-    }
-}
-impl<V> ConnRead<V> {
-    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
-        &mut self.recv
-    }
-}
-
-pub struct ConnWrite<Utp>
-where
-    Utp: UnreliableTransmit,
-{
-    utp: Arc<Utp>,
-    peer: Option<Utp::ProtocolAddress>,
-    _close_token: Arc<dyn StaticDrop>,
-}
-impl<Utp> core::fmt::Debug for ConnWrite<Utp>
-where
-    Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnWrite")
-            .field("utp", &self.utp)
-            .field("peer", &self.peer)
-            .finish()
-    }
-}
-impl<Utp> Clone for ConnWrite<Utp>
-where
-    Utp: UnreliableTransmit,
-{
-    fn clone(&self) -> Self {
-        Self {
-            utp: Arc::clone(&self.utp),
-            peer: self.peer.clone(),
-            _close_token: Arc::clone(&self._close_token),
-        }
-    }
-}
-impl<Utp> ConnWrite<Utp>
-where
-    Utp: UnreliableTransmit,
-{
-    pub fn local_addr(&self) -> std::io::Result<Utp::ProtocolAddress> {
-        self.utp.local_addr()
-    }
-    pub fn peer_addr(&self) -> Utp::ProtocolAddress {
-        match &self.peer {
-            Some(x) => x.clone(),
-            None => self.utp.peer_addr().unwrap(),
-        }
-    }
-    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match &self.peer {
-            Some(peer) => self.utp.send_to(buf, peer).await,
-            None => self.utp.send(buf).await,
-        }
-    }
-    pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        match &self.peer {
-            Some(peer) => self.utp.send_to_vectored(bufs, peer).await,
-            None => self.utp.send_vectored(bufs).await,
-        }
-    }
-    pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        match &self.peer {
-            Some(peer) => self.utp.try_send_to(buf, peer),
-            None => self.utp.try_send(buf),
-        }
-    }
-}
-
-async fn default_send_vectored<U: UnreliableTransmit>(
-    this: &U,
-    bufs: &[IoSlice<'_>],
-) -> std::io::Result<usize> {
-    match bufs.len() {
-        0 => Ok(0),
-        1 => this.send(&bufs[0]).await,
-        _ => {
-            let total = bufs.iter().map(|b| b.len()).sum();
-            let mut buf = Vec::with_capacity(total);
-            for b in bufs {
-                buf.extend_from_slice(b);
-            }
-            this.send(&buf).await
-        }
-    }
-}
-
-async fn default_send_to_vectored<U: UnreliableTransmit>(
-    this: &U,
-    bufs: &[IoSlice<'_>],
-    target: &U::ProtocolAddress,
-) -> std::io::Result<usize> {
-    match bufs.len() {
-        0 => Ok(0),
-        1 => this.send_to(&bufs[0], target).await,
-        _ => {
-            let total = bufs.iter().map(|b| b.len()).sum();
-            let mut buf = Vec::with_capacity(total);
-            for b in bufs {
-                buf.extend_from_slice(b);
-            }
-            this.send_to(&buf, target).await
-        }
-    }
-}
-
-pub trait UnreliableTransmit {
-    type ProtocolAddress: Clone;
-    fn local_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
-    fn peer_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
-    fn recv_buf(&self, buf: &mut impl BufMut) -> impl Future<Output = std::io::Result<usize>>;
-    fn recv_buf_from(
-        &self,
-        buf: &mut impl BufMut,
-    ) -> impl Future<Output = std::io::Result<(usize, Self::ProtocolAddress)>>;
-    fn send(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<usize>>;
-    fn send_to(
-        &self,
-        buf: &[u8],
-        target: &Self::ProtocolAddress,
-    ) -> impl Future<Output = std::io::Result<usize>>;
-    fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> impl Future<Output = std::io::Result<usize>>;
-    fn send_to_vectored(
-        &self,
-        bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
-    ) -> impl Future<Output = std::io::Result<usize>>;
-    fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize>;
-    fn is_send_vectored(&self) -> bool;
-}
-impl UnreliableTransmit for tokio::net::UdpSocket {
-    type ProtocolAddress = SocketAddr;
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.local_addr()
-    }
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.peer_addr()
-    }
-    async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
-        self.recv_buf(buf).await
-    }
-    async fn recv_buf_from(
-        &self,
-        buf: &mut impl BufMut,
-    ) -> std::io::Result<(usize, Self::ProtocolAddress)> {
-        self.recv_buf_from(buf).await
-    }
-    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.send(buf).await
-    }
-    async fn send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
-        self.send_to(buf, target).await
-    }
-    fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.try_send(buf)
-    }
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
-        self.try_send_to(buf, *target)
-    }
-    async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        default_send_vectored(self, bufs).await
-    }
-    async fn send_to_vectored(
-        &self,
-        bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
-    ) -> std::io::Result<usize> {
-        default_send_to_vectored(self, bufs, target).await
-    }
-    fn is_send_vectored(&self) -> bool {
-        false
-    }
-}
-
-impl UnreliableTransmit for tokio_udp::UdpSocket {
-    type ProtocolAddress = SocketAddr;
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.local_addr()
-    }
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.peer_addr()
-    }
-    async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
-        self.recv_buf(buf).await
-    }
-    async fn recv_buf_from(
-        &self,
-        buf: &mut impl BufMut,
-    ) -> std::io::Result<(usize, Self::ProtocolAddress)> {
-        self.recv_buf_from(buf).await
-    }
-    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.send(buf).await
-    }
-    async fn send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
-        self.send_to_vectored(&[IoSlice::new(buf)], target).await
-    }
-    fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.try_send(buf)
-    }
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
-        self.try_send_to(buf, target)
-    }
-    async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        self.send_vectored(bufs).await
-    }
-    async fn send_to_vectored(
-        &self,
-        bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
-    ) -> std::io::Result<usize> {
-        self.send_to_vectored(bufs, target).await
-    }
-    fn is_send_vectored(&self) -> bool {
-        tokio_udp::is_vectored_supported()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -600,75 +295,6 @@ mod tests {
 
         client.send(send_msg_1).await.unwrap();
         second_accept.await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_dead_connection_does_not_evict_its_successor() {
-        let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
-        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let listen_addr = udp.local_addr().unwrap();
-        let listener = UtpListener::new_identity_dispatch(udp, dispatcher_buffer_size);
-        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        client.connect(listen_addr).await.unwrap();
-        client.send(b"a").await.unwrap();
-        let (read_a, write_a) = listener.accept().await.unwrap().split();
-        drop(read_a);
-        client.send(b"b").await.unwrap();
-        let mut conn_b = listener.accept().await.unwrap();
-        assert_eq!(conn_b.read().recv().recv().await.unwrap().as_ref(), b"b");
-        drop(write_a);
-        client.send(b"c").await.unwrap();
-        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = listener.accept() => None,
-                msg = conn_b.read().recv().recv() => msg,
-            }
-        })
-        .await
-        .expect("neither a dispatch nor an accept happened");
-        let dispatched = dispatched
-            .expect("the successor was evicted: its packet accepted a third connection instead");
-        assert_eq!(dispatched.as_ref(), b"c");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_dead_connection_does_not_block_reopening_its_key() {
-        const KEY: u8 = 7;
-        let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
-        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        udp.connect(peer.local_addr().unwrap()).await.unwrap();
-        let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((KEY, pkt));
-        let listener: UtpListener<tokio_udp::UdpSocket, u8, Packet> =
-            UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
-        let (read, write) = listener.open(KEY).expect("the key was free").split();
-        drop(read);
-        let reopened = listener
-            .open(KEY)
-            .expect("a dead connection's leftover entry refused the key");
-        let (mut reopened_read, _reopened_write) = reopened.split();
-        peer.send_to_vectored(&[IoSlice::new(b"x")], &listener.utp.local_addr().unwrap())
-            .await
-            .unwrap();
-        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = listener.accept() => None,
-                msg = reopened_read.recv().recv() => msg,
-            }
-        })
-        .await
-        .expect("neither a dispatch nor an accept happened")
-        .expect("the reopened connection never got the packet");
-        assert_eq!(dispatched.as_ref(), b"x");
-        drop(write);
     }
 
     #[tokio::test(flavor = "multi_thread")]
