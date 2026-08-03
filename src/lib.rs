@@ -1,11 +1,10 @@
-use core::num::NonZeroUsize;
-#[cfg(test)]
 use core::net::SocketAddr;
+use core::num::NonZeroUsize;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -102,7 +101,7 @@ where
     conn_table: ConnTable<K, V>,
     pkt_buf_pool: ArcObjPool<BytesMut>,
     dispatcher_buffer_size: NonZeroUsize,
-    dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
+    dispatch: Dispatch<SocketAddr, K, V>,
     stats: ListenerStats,
     crypto_warn_limiter: RateLimiter,
 }
@@ -119,13 +118,13 @@ where
             .finish()
     }
 }
-impl<Utp> UtpListener<Utp, Utp::ProtocolAddress, Packet>
+impl<Utp> UtpListener<Utp, SocketAddr, Packet>
 where
     Utp: UnreliableTransmit,
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(rtp: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
-        let dispatch = |addr: &Utp::ProtocolAddress, packet: Packet| Some((addr.clone(), packet));
+        let dispatch = |addr: &SocketAddr, packet: Packet| Some((addr.clone(), packet));
         UtpListener::new(rtp, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
@@ -136,7 +135,7 @@ where
     pub fn new(
         utp: Utp,
         dispatcher_buffer_size: NonZeroUsize,
-        dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
+        dispatch: Dispatch<SocketAddr, K, V>,
     ) -> Self {
         let pkt_buf_pool = ArcObjPool::new(
             None,
@@ -162,7 +161,7 @@ where
 impl<Utp, K, V> UtpListener<Utp, K, V>
 where
     Utp: UnreliableTransmit,
-    Utp::ProtocolAddress: core::fmt::Debug + PartialEq,
+    SocketAddr: core::fmt::Debug + PartialEq,
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
@@ -198,10 +197,8 @@ where
                 if self.crypto_warn_limiter.fire() {
                     tracing::warn!(
                         ?addr,
-                        packets_dropped_rejected = self
-                            .stats
-                            .packets_dropped_rejected
-                            .load(Ordering::Relaxed),
+                        packets_dropped_rejected =
+                            self.stats.packets_dropped_rejected.load(Ordering::Relaxed),
                         "dropping packet rejected by dispatch (possible keyed decode failure)"
                     );
                 }
@@ -213,7 +210,9 @@ where
             if let Some(tx) = conn_table.get(&key) {
                 match tx.try_send(value) {
                     Ok(_) => {
-                        self.stats.packets_dispatched.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .packets_dispatched
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -229,8 +228,12 @@ where
             let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
             tx.try_send(value).unwrap();
             conn_table.insert(key.clone(), tx.clone());
-            self.stats.packets_dispatched.fetch_add(1, Ordering::Relaxed);
-            self.stats.connections_opened.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .packets_dispatched
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_opened
+                .fetch_add(1, Ordering::Relaxed);
 
             drop(conn_table);
 
@@ -260,7 +263,9 @@ where
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
         conn_table.insert(conn_key.clone(), tx.clone());
         drop(conn_table);
-        self.stats.connections_opened.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .connections_opened
+            .fetch_add(1, Ordering::Relaxed);
         Some(self.wrap_handle(conn_key, tx, rx, peer_addr))
     }
 
@@ -270,7 +275,7 @@ where
         conn_key: K,
         tx: tokio::sync::mpsc::Sender<V>,
         rx: tokio::sync::mpsc::Receiver<V>,
-        peer_addr: Utp::ProtocolAddress,
+        peer_addr: SocketAddr,
     ) -> Conn<Utp, K, V> {
         let close_token = ConnCloseToken {
             conn_key: conn_key.clone(),
@@ -498,12 +503,12 @@ mod tests {
             conn.read().recv().recv().await.unwrap().as_ref(),
             b"accepted"
         );
+        assert_eq!(listener.stats().packets_received.load(Ordering::Relaxed), 2);
         assert_eq!(
-            listener.stats().packets_received.load(Ordering::Relaxed),
-            2
-        );
-        assert_eq!(
-            listener.stats().packets_dropped_rejected.load(Ordering::Relaxed),
+            listener
+                .stats()
+                .packets_dropped_rejected
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
@@ -574,7 +579,8 @@ mod tests {
             1
         );
         assert_eq!(
-            listener.stats()
+            listener
+                .stats()
                 .packets_dropped_dispatcher_full
                 .load(Ordering::Relaxed),
             1

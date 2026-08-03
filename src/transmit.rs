@@ -24,7 +24,7 @@ async fn default_send_vectored<U: UnreliableTransmit>(
 async fn default_send_to_vectored<U: UnreliableTransmit>(
     this: &U,
     bufs: &[IoSlice<'_>],
-    target: &U::ProtocolAddress,
+    target: &SocketAddr,
 ) -> std::io::Result<usize> {
     match bufs.len() {
         0 => Ok(0),
@@ -41,32 +41,30 @@ async fn default_send_to_vectored<U: UnreliableTransmit>(
 }
 
 pub trait UnreliableTransmit {
-    type ProtocolAddress: Clone;
-    fn local_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
-    fn peer_addr(&self) -> std::io::Result<Self::ProtocolAddress>;
+    fn local_addr(&self) -> std::io::Result<SocketAddr>;
+    fn peer_addr(&self) -> std::io::Result<SocketAddr>;
     fn recv_buf(&self, buf: &mut impl BufMut) -> impl Future<Output = std::io::Result<usize>>;
     fn recv_buf_from(
         &self,
         buf: &mut impl BufMut,
-    ) -> impl Future<Output = std::io::Result<(usize, Self::ProtocolAddress)>>;
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>>;
     fn send(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<usize>>;
     fn send_to(
         &self,
         buf: &[u8],
-        target: &Self::ProtocolAddress,
+        target: &SocketAddr,
     ) -> impl Future<Output = std::io::Result<usize>>;
     fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> impl Future<Output = std::io::Result<usize>>;
     fn send_to_vectored(
         &self,
         bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
+        target: &SocketAddr,
     ) -> impl Future<Output = std::io::Result<usize>>;
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize>;
+    fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize>;
     fn is_send_vectored(&self) -> bool;
 }
 impl UnreliableTransmit for tokio::net::UdpSocket {
-    type ProtocolAddress = SocketAddr;
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.local_addr()
     }
@@ -76,22 +74,19 @@ impl UnreliableTransmit for tokio::net::UdpSocket {
     async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
         self.recv_buf(buf).await
     }
-    async fn recv_buf_from(
-        &self,
-        buf: &mut impl BufMut,
-    ) -> std::io::Result<(usize, Self::ProtocolAddress)> {
+    async fn recv_buf_from(&self, buf: &mut impl BufMut) -> std::io::Result<(usize, SocketAddr)> {
         self.recv_buf_from(buf).await
     }
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf).await
     }
-    async fn send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize> {
         self.send_to(buf, target).await
     }
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.try_send(buf)
     }
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
+    fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize> {
         self.try_send_to(buf, *target)
     }
     async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
@@ -100,7 +95,7 @@ impl UnreliableTransmit for tokio::net::UdpSocket {
     async fn send_to_vectored(
         &self,
         bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
+        target: &SocketAddr,
     ) -> std::io::Result<usize> {
         default_send_to_vectored(self, bufs, target).await
     }
@@ -110,7 +105,6 @@ impl UnreliableTransmit for tokio::net::UdpSocket {
 }
 
 impl UnreliableTransmit for tokio_udp::UdpSocket {
-    type ProtocolAddress = SocketAddr;
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.local_addr()
     }
@@ -120,22 +114,19 @@ impl UnreliableTransmit for tokio_udp::UdpSocket {
     async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
         self.recv_buf(buf).await
     }
-    async fn recv_buf_from(
-        &self,
-        buf: &mut impl BufMut,
-    ) -> std::io::Result<(usize, Self::ProtocolAddress)> {
+    async fn recv_buf_from(&self, buf: &mut impl BufMut) -> std::io::Result<(usize, SocketAddr)> {
         self.recv_buf_from(buf).await
     }
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf).await
     }
-    async fn send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize> {
         self.send_to_vectored(&[IoSlice::new(buf)], target).await
     }
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.try_send(buf)
     }
-    fn try_send_to(&self, buf: &[u8], target: &Self::ProtocolAddress) -> std::io::Result<usize> {
+    fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize> {
         self.try_send_to(buf, target)
     }
     async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
@@ -144,7 +135,7 @@ impl UnreliableTransmit for tokio_udp::UdpSocket {
     async fn send_to_vectored(
         &self,
         bufs: &[IoSlice<'_>],
-        target: &Self::ProtocolAddress,
+        target: &SocketAddr,
     ) -> std::io::Result<usize> {
         self.send_to_vectored(bufs, target).await
     }

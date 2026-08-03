@@ -1,4 +1,4 @@
-use std::{io::IoSlice, sync::Arc};
+use std::{io::IoSlice, net::SocketAddr, sync::Arc};
 
 use crate::{ConnTable, UnreliableTransmit};
 
@@ -55,7 +55,7 @@ where
 impl<Utp, K: core::fmt::Debug, V> core::fmt::Debug for Conn<Utp, K, V>
 where
     Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
+    SocketAddr: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Conn")
@@ -105,13 +105,13 @@ where
     Utp: UnreliableTransmit,
 {
     pub(crate) utp: Arc<Utp>,
-    pub(crate) peer: Option<Utp::ProtocolAddress>,
+    pub(crate) peer: Option<SocketAddr>,
     pub(crate) _close_token: Arc<dyn StaticDrop>,
 }
 impl<Utp> core::fmt::Debug for ConnWrite<Utp>
 where
     Utp: UnreliableTransmit + core::fmt::Debug,
-    Utp::ProtocolAddress: core::fmt::Debug,
+    SocketAddr: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnWrite")
@@ -136,10 +136,10 @@ impl<Utp> ConnWrite<Utp>
 where
     Utp: UnreliableTransmit,
 {
-    pub fn local_addr(&self) -> std::io::Result<Utp::ProtocolAddress> {
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.utp.local_addr()
     }
-    pub fn peer_addr(&self) -> Utp::ProtocolAddress {
+    pub fn peer_addr(&self) -> SocketAddr {
         match &self.peer {
             Some(x) => x.clone(),
             None => self.utp.peer_addr().unwrap(),
