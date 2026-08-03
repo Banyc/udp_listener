@@ -3,7 +3,11 @@ use core::num::NonZeroUsize;
 use core::net::SocketAddr;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use bytes::BytesMut;
@@ -21,6 +25,68 @@ const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 pub type Packet = ObjScoped<BytesMut>;
 
+/// Drop/dispatch accounting for a [`UtpListener`] accept loop.
+///
+/// The dispatch loop used to fold every silent-drop reason into one
+/// `continue`; each counter below tracks one distinct path so that packet
+/// loss is observable instead of vanishing into the loop.
+pub struct ListenerStats {
+    /// Datagrams read into the accept loop, before any drop decision.
+    pub packets_received: AtomicU64,
+    /// Datagrams placed into a sub-connection's buffer.
+    pub packets_dispatched: AtomicU64,
+    /// Datagrams dropped because the dispatch closure returned `None`.
+    ///
+    /// In a keyed setup this is where a keyed-packet decode/decrypt failure
+    /// surfaces (e.g. `rtp::keyed_udp::dispatch` rejects an undecodable
+    /// datagram); the crate itself has no `CryptoError` type.
+    pub packets_dropped_rejected: AtomicU64,
+    /// Datagrams dropped because the sub-connection's dispatcher buffer was full.
+    pub packets_dropped_dispatcher_full: AtomicU64,
+    /// Datagrams dropped because they filled the whole packet buffer.
+    pub packets_dropped_pkt_buf_overflow: AtomicU64,
+    /// Sub-connections created by [`UtpListener::accept`] and [`UtpListener::open`].
+    pub connections_opened: AtomicU64,
+}
+impl ListenerStats {
+    fn new() -> Self {
+        Self {
+            packets_received: AtomicU64::new(0),
+            packets_dispatched: AtomicU64::new(0),
+            packets_dropped_rejected: AtomicU64::new(0),
+            packets_dropped_dispatcher_full: AtomicU64::new(0),
+            packets_dropped_pkt_buf_overflow: AtomicU64::new(0),
+            connections_opened: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Coarse rate limiter so high-frequency drop paths do not spam the log.
+struct RateLimiter {
+    cooldown: Duration,
+    last: Mutex<Option<Instant>>,
+}
+impl RateLimiter {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            last: Mutex::new(None),
+        }
+    }
+    /// Returns `true` if the caller should emit the guarded log line.
+    fn fire(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self.last.lock().unwrap();
+        match *last {
+            Some(prev) if now.duration_since(prev) < self.cooldown => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
 pub type Dispatch<Addr, K, V> =
     Arc<dyn Fn(&Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
@@ -37,6 +103,8 @@ where
     pkt_buf_pool: ArcObjPool<BytesMut>,
     dispatcher_buffer_size: NonZeroUsize,
     dispatch: Dispatch<Utp::ProtocolAddress, K, V>,
+    stats: ListenerStats,
+    crypto_warn_limiter: RateLimiter,
 }
 impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
 where
@@ -86,12 +154,15 @@ where
             pkt_buf_pool,
             dispatcher_buffer_size,
             dispatch,
+            stats: ListenerStats::new(),
+            crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
         }
     }
 }
 impl<Utp, K, V> UtpListener<Utp, K, V>
 where
     Utp: UnreliableTransmit,
+    Utp::ProtocolAddress: core::fmt::Debug + PartialEq,
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
@@ -112,11 +183,28 @@ where
             } else {
                 self.utp.recv_buf_from(&mut *pkt_buf).await?
             };
+            self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
             if n == PACKET_BUFFER_LENGTH {
+                self.stats
+                    .packets_dropped_pkt_buf_overflow
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             let Some((key, mut value)) = (self.dispatch)(&addr, pkt_buf) else {
+                self.stats
+                    .packets_dropped_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                if self.crypto_warn_limiter.fire() {
+                    tracing::warn!(
+                        ?addr,
+                        packets_dropped_rejected = self
+                            .stats
+                            .packets_dropped_rejected
+                            .load(Ordering::Relaxed),
+                        "dropping packet rejected by dispatch (possible keyed decode failure)"
+                    );
+                }
                 continue;
             };
 
@@ -124,7 +212,16 @@ where
 
             if let Some(tx) = conn_table.get(&key) {
                 match tx.try_send(value) {
-                    Ok(_) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => continue,
+                    Ok(_) => {
+                        self.stats.packets_dispatched.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        self.stats
+                            .packets_dropped_dispatcher_full
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => value = v,
                 }
             }
@@ -132,11 +229,18 @@ where
             let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
             tx.try_send(value).unwrap();
             conn_table.insert(key.clone(), tx.clone());
+            self.stats.packets_dispatched.fetch_add(1, Ordering::Relaxed);
+            self.stats.connections_opened.fetch_add(1, Ordering::Relaxed);
 
             drop(conn_table);
 
             return Ok(self.wrap_handle(key, tx, rx, addr));
         }
+    }
+
+    /// Snapshot access to the listener's drop/dispatch counters.
+    pub fn stats(&self) -> &ListenerStats {
+        &self.stats
     }
 
     /// This method is intended to open a sub-connection under a connected unreliable transmission socket.
@@ -156,6 +260,7 @@ where
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
         conn_table.insert(conn_key.clone(), tx.clone());
         drop(conn_table);
+        self.stats.connections_opened.fetch_add(1, Ordering::Relaxed);
         Some(self.wrap_handle(conn_key, tx, rx, peer_addr))
     }
 
@@ -178,7 +283,7 @@ where
             _close_token: close_token.clone(),
         };
         let udp_to = if self.is_utp_connected {
-            // assert_eq!(peer_addr, self.utp.peer_addr().unwrap());
+            assert_eq!(peer_addr, self.utp.peer_addr().unwrap());
             None
         } else {
             Some(peer_addr)
@@ -363,5 +468,117 @@ mod tests {
         while let Some(res) = tasks.join_next().await {
             res.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counters_distinguish_rejected_from_dispatched_packets() {
+        let dispatcher_buffer_size = NonZeroUsize::new(4).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        // A packet whose key byte is b'x' cannot be decoded: the dispatch
+        // rejects it (this is where a keyed decode/decrypt failure surfaces).
+        let dispatch = |addr: &SocketAddr, mut packet: Packet| {
+            if packet.first() == Some(&b'x') {
+                return None;
+            }
+            packet.advance(1);
+            Some((*addr, packet))
+        };
+        let listener = UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+        client.send(b"xrejected").await.unwrap();
+        client.send(b"aaccepted").await.unwrap();
+        let mut conn = listener.accept().await.unwrap();
+        assert_eq!(
+            conn.read().recv().recv().await.unwrap().as_ref(),
+            b"accepted"
+        );
+        assert_eq!(
+            listener.stats().packets_received.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            listener.stats().packets_dropped_rejected.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            listener.stats().packets_dispatched.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            listener.stats().connections_opened.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counters_distinguish_dispatcher_buffer_overflows() {
+        let dispatcher_buffer_size = NonZeroUsize::new(1).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((0u8, pkt));
+        let listener = Arc::new(UtpListener::new(
+            udp,
+            dispatcher_buffer_size,
+            Arc::new(dispatch),
+        ));
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+        client.send(b"a").await.unwrap();
+        let mut conn = listener.accept().await.unwrap();
+        // Now that key 0's 1-slot channel holds b"a" and no reader is draining
+        // it, a second packet must be dropped as a dispatcher overflow rather
+        // than silently folded into the success path.
+        let driver = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move {
+                loop {
+                    let _ = listener.accept().await;
+                }
+            })
+        };
+        client.send(b"b").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if listener
+                    .stats()
+                    .packets_dropped_dispatcher_full
+                    .load(Ordering::Relaxed)
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second packet was never dropped as a dispatcher overflow");
+        let pkt = conn
+            .read()
+            .recv()
+            .recv()
+            .await
+            .expect("the connection was closed");
+        assert_eq!(pkt.as_ref(), b"a");
+        assert_eq!(
+            listener.stats().packets_dispatched.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            listener.stats()
+                .packets_dropped_dispatcher_full
+                .load(Ordering::Relaxed),
+            1
+        );
+        driver.abort();
     }
 }

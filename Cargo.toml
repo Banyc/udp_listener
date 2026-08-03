@@ -14,6 +14,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.2" }
+tracing = "0.1"
 
 [dev-dependencies]
 futures = "0.3"
