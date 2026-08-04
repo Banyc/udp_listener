@@ -127,7 +127,7 @@ where
     fn clone(&self) -> Self {
         Self {
             utp: Arc::clone(&self.utp),
-            peer: self.peer.clone(),
+            peer: self.peer,
             _close_token: Arc::clone(&self._close_token),
         }
     }
@@ -141,7 +141,7 @@ where
     }
     pub fn peer_addr(&self) -> SocketAddr {
         match &self.peer {
-            Some(x) => x.clone(),
+            Some(x) => *x,
             None => self.utp.peer_addr().unwrap(),
         }
     }

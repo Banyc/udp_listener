@@ -124,7 +124,7 @@ where
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(socket: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
-        let dispatch = |addr: &SocketAddr, packet: Packet| Some((addr.clone(), packet));
+        let dispatch = |addr: &SocketAddr, packet: Packet| Some((*addr, packet));
         UtpListener::new(socket, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
