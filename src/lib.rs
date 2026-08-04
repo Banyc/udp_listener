@@ -44,7 +44,7 @@ pub struct ListenerStats {
     pub packets_dropped_dispatcher_full: AtomicU64,
     /// Datagrams dropped because they filled the whole packet buffer.
     pub packets_dropped_pkt_buf_overflow: AtomicU64,
-    /// Sub-connections created by [`UtpListener::accept`] and [`UtpListener::open`].
+    /// Sub-connections created by [`UtpListener::poll_next_conn`] and [`UtpListener::register_conn`].
     pub connections_opened: AtomicU64,
 }
 impl ListenerStats {
@@ -86,7 +86,7 @@ impl RateLimiter {
     }
 }
 
-pub type Dispatch<Addr, K, V> =
+pub type Classify<Addr, K, V> =
     Arc<dyn Fn(&Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
 
 pub(crate) type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
@@ -101,7 +101,7 @@ where
     conn_table: ConnTable<K, V>,
     pkt_buf_pool: ArcObjPool<BytesMut>,
     dispatcher_buffer_size: NonZeroUsize,
-    dispatch: Dispatch<SocketAddr, K, V>,
+    dispatch: Classify<SocketAddr, K, V>,
     stats: ListenerStats,
     crypto_warn_limiter: RateLimiter,
 }
@@ -123,9 +123,9 @@ where
     Utp: UnreliableTransmit,
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
-    pub fn new_identity_dispatch(rtp: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
+    pub fn new_identity_dispatch(socket: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
         let dispatch = |addr: &SocketAddr, packet: Packet| Some((addr.clone(), packet));
-        UtpListener::new(rtp, dispatcher_buffer_size, Arc::new(dispatch))
+        UtpListener::new(socket, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
 impl<Utp, K, V> UtpListener<Utp, K, V>
@@ -135,7 +135,7 @@ where
     pub fn new(
         utp: Utp,
         dispatcher_buffer_size: NonZeroUsize,
-        dispatch: Dispatch<SocketAddr, K, V>,
+        dispatch: Classify<SocketAddr, K, V>,
     ) -> Self {
         let pkt_buf_pool = ArcObjPool::new(
             None,
@@ -172,7 +172,7 @@ where
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn accept(&self) -> std::io::Result<Conn<Utp, K, V>> {
+    pub async fn poll_next_conn(&self) -> std::io::Result<Conn<Utp, K, V>> {
         loop {
             let mut pkt_buf = self.pkt_buf_pool.take_scoped();
             let (n, addr) = if self.is_utp_connected {
@@ -237,7 +237,7 @@ where
 
             drop(conn_table);
 
-            return Ok(self.wrap_handle(key, tx, rx, addr));
+            return Ok(self.conn_from_parts(key, tx, rx, addr));
         }
     }
 
@@ -248,13 +248,13 @@ where
 
     /// This method is intended to open a sub-connection under a connected unreliable transmission socket.
     ///
-    /// You still need to put [`Self::accept()`] in a loop to drive the packet dispatch among the sub-connections.
+    /// You still need to put [`Self::poll_next_conn()`] in a loop to drive the packet dispatch among the sub-connections.
     ///
     /// Return [`None`] if either:
     ///
     /// - The unreliable transmission socket is unconnected;
     /// - The `conn_key` has already been registered in the connection table.
-    pub fn open(&self, conn_key: K) -> Option<Conn<Utp, K, V>> {
+    pub fn register_conn(&self, conn_key: K) -> Option<Conn<Utp, K, V>> {
         let peer_addr = self.utp.peer_addr().ok()?;
         let mut conn_table = self.conn_table.lock().unwrap();
         if conn_table.get(&conn_key).is_some_and(|tx| !tx.is_closed()) {
@@ -266,11 +266,11 @@ where
         self.stats
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
-        Some(self.wrap_handle(conn_key, tx, rx, peer_addr))
+        Some(self.conn_from_parts(conn_key, tx, rx, peer_addr))
     }
 
     /// Pass in `peer_addr` as [`None`] iff the underlying unreliable transmission socket is connected.
-    fn wrap_handle(
+    fn conn_from_parts(
         &self,
         conn_key: K,
         tx: tokio::sync::mpsc::Sender<V>,
@@ -337,14 +337,17 @@ mod tests {
         client.connect(listen_addr).await.unwrap();
         let payload = vec![0xABu8; PAYLOAD_LEN];
         client.send(&payload).await.unwrap();
-        let mut conn = listener.accept().await.unwrap();
-        assert_eq!(conn.read().recv().recv().await.unwrap().len(), BODY_LEN);
+        let mut conn = listener.poll_next_conn().await.unwrap();
+        assert_eq!(
+            conn.read_half().read_half().recv().await.unwrap().len(),
+            BODY_LEN
+        );
         for i in 0..64 {
             client.send(&payload).await.unwrap();
             let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 tokio::select! {
-                    _ = listener.accept() => None,
-                    pkt = conn.read().recv().recv() => pkt,
+                    _ = listener.poll_next_conn() => None,
+                    pkt = conn.read_half().read_half().recv() => pkt,
                 }
             })
             .await
@@ -374,16 +377,16 @@ mod tests {
             let client_recv_msg = client_recv_msg.clone();
             let second_accept = second_accept.clone();
             async move {
-                let mut client = listener.accept().await.unwrap();
+                let mut client = listener.poll_next_conn().await.unwrap();
                 tokio::spawn(async move {
-                    let msg = client.read().recv().recv().await.unwrap();
+                    let msg = client.read_half().read_half().recv().await.unwrap();
                     assert_eq!(msg.as_ref(), send_msg_1);
-                    let msg = client.read().recv().recv().await.unwrap();
+                    let msg = client.read_half().read_half().recv().await.unwrap();
                     assert_eq!(msg.as_ref(), send_msg_2);
                     drop(client);
                     client_recv_msg.notify_waiters();
                 });
-                listener.accept().await.unwrap();
+                listener.poll_next_conn().await.unwrap();
                 second_accept.notify_waiters();
             }
         });
@@ -438,36 +441,36 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
-            let mut conn = server.accept().await.unwrap();
+            let mut conn = server.poll_next_conn().await.unwrap();
             tokio::spawn({
                 let server = server.clone();
                 async move {
                     loop {
-                        let _ = server.accept().await;
+                        let _ = server.poll_next_conn().await;
                     }
                 }
             });
             assert_eq!(*conn.conn_key(), key);
-            let packet = conn.read().recv().recv().await.unwrap();
+            let packet = conn.read_half().read_half().recv().await.unwrap();
             assert_eq!(packet.as_ref(), msg);
             let buf = [key].iter().chain(msg).copied().collect::<Vec<u8>>();
             conn.write().send(&buf).await.unwrap();
         });
         tasks.spawn(async move {
             let client = Arc::new(client);
-            let mut conn = client.open(key).unwrap();
+            let mut conn = client.register_conn(key).unwrap();
             tokio::spawn({
                 let client = client.clone();
                 async move {
                     loop {
-                        let _ = client.accept().await;
+                        let _ = client.poll_next_conn().await;
                     }
                 }
             });
             assert_eq!(*conn.conn_key(), key);
             let buf = [key].iter().chain(msg).copied().collect::<Vec<u8>>();
             conn.write().send(&buf).await.unwrap();
-            let packet = conn.read().recv().recv().await.unwrap();
+            let packet = conn.read_half().read_half().recv().await.unwrap();
             assert_eq!(packet.as_ref(), msg);
         });
         while let Some(res) = tasks.join_next().await {
@@ -498,9 +501,9 @@ mod tests {
         client.connect(listen_addr).await.unwrap();
         client.send(b"xrejected").await.unwrap();
         client.send(b"aaccepted").await.unwrap();
-        let mut conn = listener.accept().await.unwrap();
+        let mut conn = listener.poll_next_conn().await.unwrap();
         assert_eq!(
-            conn.read().recv().recv().await.unwrap().as_ref(),
+            conn.read_half().read_half().recv().await.unwrap().as_ref(),
             b"accepted"
         );
         assert_eq!(listener.stats().packets_received.load(Ordering::Relaxed), 2);
@@ -539,7 +542,7 @@ mod tests {
             .unwrap();
         client.connect(listen_addr).await.unwrap();
         client.send(b"a").await.unwrap();
-        let mut conn = listener.accept().await.unwrap();
+        let mut conn = listener.poll_next_conn().await.unwrap();
         // Now that key 0's 1-slot channel holds b"a" and no reader is draining
         // it, a second packet must be dropped as a dispatcher overflow rather
         // than silently folded into the success path.
@@ -547,7 +550,7 @@ mod tests {
             let listener = Arc::clone(&listener);
             tokio::spawn(async move {
                 loop {
-                    let _ = listener.accept().await;
+                    let _ = listener.poll_next_conn().await;
                 }
             })
         };
@@ -568,8 +571,8 @@ mod tests {
         .await
         .expect("the second packet was never dropped as a dispatcher overflow");
         let pkt = conn
-            .read()
-            .recv()
+            .read_half()
+            .read_half()
             .recv()
             .await
             .expect("the connection was closed");

@@ -62,7 +62,7 @@ pub trait UnreliableTransmit {
     ) -> impl Future<Output = std::io::Result<usize>>;
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
     fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize>;
-    fn is_send_vectored(&self) -> bool;
+    fn supports_send_vectored(&self) -> bool;
 }
 impl UnreliableTransmit for tokio::net::UdpSocket {
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -99,7 +99,7 @@ impl UnreliableTransmit for tokio::net::UdpSocket {
     ) -> std::io::Result<usize> {
         default_send_to_vectored(self, bufs, target).await
     }
-    fn is_send_vectored(&self) -> bool {
+    fn supports_send_vectored(&self) -> bool {
         false
     }
 }
@@ -139,7 +139,7 @@ impl UnreliableTransmit for tokio_udp::UdpSocket {
     ) -> std::io::Result<usize> {
         self.send_to_vectored(bufs, target).await
     }
-    fn is_send_vectored(&self) -> bool {
+    fn supports_send_vectored(&self) -> bool {
         tokio_udp::is_vectored_supported()
     }
 }

@@ -2,8 +2,8 @@ use std::{io::IoSlice, net::SocketAddr, sync::Arc};
 
 use crate::{ConnTable, UnreliableTransmit};
 
-pub(crate) trait StaticDrop: Sync + Send + 'static {}
-impl<K, V> StaticDrop for ConnCloseToken<K, V>
+pub(crate) trait AnySendSyncStatic: Sync + Send + 'static {}
+impl<K, V> AnySendSyncStatic for ConnCloseToken<K, V>
 where
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
@@ -69,7 +69,7 @@ impl<Utp, K, V> Conn<Utp, K, V>
 where
     Utp: UnreliableTransmit,
 {
-    pub fn read(&mut self) -> &mut ConnRead<V> {
+    pub fn read_half(&mut self) -> &mut ConnRead<V> {
         &mut self.read
     }
     pub fn write(&self) -> &ConnWrite<Utp> {
@@ -85,7 +85,7 @@ where
 
 pub struct ConnRead<V> {
     pub(crate) recv: tokio::sync::mpsc::Receiver<V>,
-    pub(crate) _close_token: Arc<dyn StaticDrop>,
+    pub(crate) _close_token: Arc<dyn AnySendSyncStatic>,
 }
 impl<V> core::fmt::Debug for ConnRead<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -95,7 +95,7 @@ impl<V> core::fmt::Debug for ConnRead<V> {
     }
 }
 impl<V> ConnRead<V> {
-    pub fn recv(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
+    pub fn read_half(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
         &mut self.recv
     }
 }
@@ -106,7 +106,7 @@ where
 {
     pub(crate) utp: Arc<Utp>,
     pub(crate) peer: Option<SocketAddr>,
-    pub(crate) _close_token: Arc<dyn StaticDrop>,
+    pub(crate) _close_token: Arc<dyn AnySendSyncStatic>,
 }
 impl<Utp> core::fmt::Debug for ConnWrite<Utp>
 where
@@ -185,17 +185,26 @@ mod tests {
             .unwrap();
         client.connect(listen_addr).await.unwrap();
         client.send(b"a").await.unwrap();
-        let (read_a, write_a) = listener.accept().await.unwrap().split();
+        let (read_a, write_a) = listener.poll_next_conn().await.unwrap().split();
         drop(read_a);
         client.send(b"b").await.unwrap();
-        let mut conn_b = listener.accept().await.unwrap();
-        assert_eq!(conn_b.read().recv().recv().await.unwrap().as_ref(), b"b");
+        let mut conn_b = listener.poll_next_conn().await.unwrap();
+        assert_eq!(
+            conn_b
+                .read_half()
+                .read_half()
+                .recv()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"b"
+        );
         drop(write_a);
         client.send(b"c").await.unwrap();
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
-                _ = listener.accept() => None,
-                msg = conn_b.read().recv().recv() => msg,
+                _ = listener.poll_next_conn() => None,
+                msg = conn_b.read_half().read_half().recv() => msg,
             }
         })
         .await
@@ -219,10 +228,13 @@ mod tests {
         let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((KEY, pkt));
         let listener: UtpListener<tokio_udp::UdpSocket, u8, Packet> =
             UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
-        let (read, write) = listener.open(KEY).expect("the key was free").split();
+        let (read, write) = listener
+            .register_conn(KEY)
+            .expect("the key was free")
+            .split();
         drop(read);
         let reopened = listener
-            .open(KEY)
+            .register_conn(KEY)
             .expect("a dead connection's leftover entry refused the key");
         let (mut reopened_read, _reopened_write) = reopened.split();
         peer.send_to_vectored(&[IoSlice::new(b"x")], &listener.utp.local_addr().unwrap())
@@ -230,8 +242,8 @@ mod tests {
             .unwrap();
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
-                _ = listener.accept() => None,
-                msg = reopened_read.recv().recv() => msg,
+                _ = listener.poll_next_conn() => None,
+                msg = reopened_read.read_half().recv() => msg,
             }
         })
         .await
