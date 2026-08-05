@@ -20,9 +20,23 @@ pub use conn::{Conn, ConnRead, ConnWrite};
 pub use transmit::UnreliableTransmit;
 
 pub const PACKET_BUFFER_LENGTH: usize = 2_usize.pow(16);
+/// Capacity of the bounded queue of newly opened sub-connections waiting for
+/// [`UtpListener::accept_next`]. `dispatch_next` must not block (it is the
+/// process-lifetime dispatch loop), so an overflowed accept queue refuses the
+/// new flow and counts it in `accepts_dropped_queue_full` instead.
+const ACCEPT_QUEUE_CAPACITY: usize = 256;
 const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 pub type Packet = ObjScoped<BytesMut>;
+
+/// Outcome of a single [`UtpListener::dispatch_next`] datagram read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// The datagram was routed to an existing sub-connection (or dropped).
+    Routed,
+    /// The datagram opened a new sub-connection, queued for [`UtpListener::accept_next`].
+    Accepted,
+}
 
 /// Drop/dispatch accounting for a [`UtpListener`] accept loop.
 ///
@@ -44,6 +58,10 @@ pub struct ListenerStats {
     pub packets_dropped_dispatcher_full: AtomicU64,
     /// Datagrams dropped because they filled the whole packet buffer.
     pub packets_dropped_pkt_buf_overflow: AtomicU64,
+    /// Newly opened sub-connections dropped because the bounded accept queue
+    /// was full. The datagram that opened the flow is consumed either way; only
+    /// the flow's acceptance is refused under overload.
+    pub accepts_dropped_queue_full: AtomicU64,
     /// Sub-connections created by [`UtpListener::poll_next_conn`] and [`UtpListener::register_conn`].
     pub connections_opened: AtomicU64,
 }
@@ -55,6 +73,7 @@ impl ListenerStats {
             packets_dropped_rejected: AtomicU64::new(0),
             packets_dropped_dispatcher_full: AtomicU64::new(0),
             packets_dropped_pkt_buf_overflow: AtomicU64::new(0),
+            accepts_dropped_queue_full: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
         }
     }
@@ -104,6 +123,8 @@ where
     dispatch: Classify<SocketAddr, K, V>,
     stats: ListenerStats,
     crypto_warn_limiter: RateLimiter,
+    accept_queue_tx: tokio::sync::mpsc::Sender<Conn<Utp, K, V>>,
+    accept_queue_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Conn<Utp, K, V>>>,
 }
 impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
 where
@@ -146,6 +167,8 @@ where
                 buf.reserve(PACKET_BUFFER_LENGTH);
             },
         );
+        let (accept_queue_tx, accept_queue_rx) =
+            tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAPACITY);
         Self {
             is_utp_connected: utp.peer_addr().is_ok(),
             utp: Arc::new(utp),
@@ -155,6 +178,8 @@ where
             dispatch,
             stats: ListenerStats::new(),
             crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
+            accept_queue_tx,
+            accept_queue_rx: tokio::sync::Mutex::new(accept_queue_rx),
         }
     }
 }
@@ -165,80 +190,138 @@ where
     K: Clone + core::hash::Hash + Eq + Sync + Send + 'static,
     V: Sync + Send + 'static,
 {
+    /// Combined accept-and-dispatch loop, kept for backward compatibility.
+    ///
     /// Side-effect: This method also dispatches packets to all the accepted sub-connections.
     ///
     /// You should keep this method in a loop.
+    ///
+    /// This is the combined form of [`Self::dispatch_next`] + [`Self::accept_next`]:
+    /// use the split form when packet dispatch and accepted-flow ownership need
+    /// separate owners.
     ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
     pub async fn poll_next_conn(&self) -> std::io::Result<Conn<Utp, K, V>> {
         loop {
-            let mut pkt_buf = self.pkt_buf_pool.take_scoped();
-            let (n, addr) = if self.is_utp_connected {
-                let n = self.utp.recv_buf(&mut *pkt_buf).await?;
-                let addr = self.utp.peer_addr()?;
-                (n, addr)
-            } else {
-                self.utp.recv_buf_from(&mut *pkt_buf).await?
-            };
-            self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-            if n == PACKET_BUFFER_LENGTH {
-                self.stats
-                    .packets_dropped_pkt_buf_overflow
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            let Some((key, mut value)) = (self.dispatch)(&addr, pkt_buf) else {
-                self.stats
-                    .packets_dropped_rejected
-                    .fetch_add(1, Ordering::Relaxed);
-                if self.crypto_warn_limiter.fire() {
-                    tracing::warn!(
-                        ?addr,
-                        packets_dropped_rejected =
-                            self.stats.packets_dropped_rejected.load(Ordering::Relaxed),
-                        "dropping packet rejected by dispatch (possible keyed decode failure)"
-                    );
-                }
-                continue;
-            };
-
-            let mut conn_table = self.conn_table.lock().unwrap();
-
-            if let Some(tx) = conn_table.get(&key) {
-                match tx.try_send(value) {
-                    Ok(_) => {
-                        self.stats
-                            .packets_dispatched
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        self.stats
-                            .packets_dropped_dispatcher_full
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => value = v,
+            match self.dispatch_next().await? {
+                Dispatch::Routed => continue,
+                Dispatch::Accepted => {
+                    return self.accept_next().await.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "accept queue closed",
+                        )
+                    })
                 }
             }
-
-            let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
-            tx.try_send(value).unwrap();
-            conn_table.insert(key.clone(), tx.clone());
-            self.stats
-                .packets_dispatched
-                .fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .connections_opened
-                .fetch_add(1, Ordering::Relaxed);
-
-            drop(conn_table);
-
-            return Ok(self.conn_from_parts(key, tx, rx, addr));
         }
+    }
+
+    /// Read ONE datagram and dispatch it, without accepting new sub-connections.
+    ///
+    /// Returns [`Dispatch::Routed`] when the datagram was handed to an existing
+    /// sub-connection (or dropped by a dispatch/drop path); returns
+    /// [`Dispatch::Accepted`] when the datagram opened a new sub-connection,
+    /// which is queued internally for [`Self::accept_next`].
+    ///
+    /// You should keep this method in a loop to drive packet dispatch among the
+    /// accepted sub-connections. Combined with [`Self::accept_next`] this is
+    /// the split form of [`Self::poll_next_conn`].
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
+    pub async fn dispatch_next(&self) -> std::io::Result<Dispatch> {
+        let mut pkt_buf = self.pkt_buf_pool.take_scoped();
+        let (n, addr) = if self.is_utp_connected {
+            let n = self.utp.recv_buf(&mut *pkt_buf).await?;
+            let addr = self.utp.peer_addr()?;
+            (n, addr)
+        } else {
+            self.utp.recv_buf_from(&mut *pkt_buf).await?
+        };
+        self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+        if n == PACKET_BUFFER_LENGTH {
+            self.stats
+                .packets_dropped_pkt_buf_overflow
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Dispatch::Routed);
+        }
+
+        let Some((key, mut value)) = (self.dispatch)(&addr, pkt_buf) else {
+            self.stats
+                .packets_dropped_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            if self.crypto_warn_limiter.fire() {
+                tracing::warn!(
+                    ?addr,
+                    packets_dropped_rejected =
+                        self.stats.packets_dropped_rejected.load(Ordering::Relaxed),
+                    "dropping packet rejected by dispatch (possible keyed decode failure)"
+                );
+            }
+            return Ok(Dispatch::Routed);
+        };
+
+        let mut conn_table = self.conn_table.lock().unwrap();
+
+        if let Some(tx) = conn_table.get(&key) {
+            match tx.try_send(value) {
+                Ok(_) => {
+                    self.stats
+                        .packets_dispatched
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(Dispatch::Routed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.stats
+                        .packets_dropped_dispatcher_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(Dispatch::Routed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => value = v,
+            }
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
+        tx.try_send(value).unwrap();
+        conn_table.insert(key.clone(), tx.clone());
+        self.stats
+            .packets_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .connections_opened
+            .fetch_add(1, Ordering::Relaxed);
+
+        drop(conn_table);
+
+        let conn = self.conn_from_parts(key, tx, rx, addr);
+        match self.accept_queue_tx.try_send(conn) {
+            Ok(_) => Ok(Dispatch::Accepted),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The accept side is not draining its bounded queue; refuse the
+                // new flow rather than buffer unboundedly.
+                self.stats
+                    .accepts_dropped_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(Dispatch::Routed)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.stats
+                    .accepts_dropped_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(Dispatch::Routed)
+            }
+        }
+    }
+
+    /// Receive the next newly opened sub-connection queued by [`Self::dispatch_next`].
+    ///
+    /// Returns `None` when the listener has been dropped (accept queue closed).
+    pub async fn accept_next(&self) -> Option<Conn<Utp, K, V>> {
+        self.accept_queue_rx.lock().await.recv().await
     }
 
     /// Snapshot access to the listener's drop/dispatch counters.
