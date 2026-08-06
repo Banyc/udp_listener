@@ -17,6 +17,7 @@ where
     pub(crate) conn_key: K,
     pub(crate) conn_table: ConnTable<K, V>,
     pub(crate) tx: tokio::sync::mpsc::Sender<V>,
+    pub(crate) idle: tokio::sync::watch::Sender<bool>,
 }
 impl<K, V> core::fmt::Debug for ConnCloseToken<K, V>
 where
@@ -39,6 +40,9 @@ where
             .is_some_and(|tx| tx.same_channel(&self.tx));
         if is_still_ours {
             conn_table.remove(&self.conn_key);
+            if conn_table.is_empty() {
+                let _ = self.idle.send(true);
+            }
         }
     }
 }

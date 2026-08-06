@@ -3,14 +3,15 @@ use core::num::NonZeroUsize;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use bytes::BytesMut;
 use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
+use tokio::sync::watch;
 
 mod conn;
 mod transmit;
@@ -125,6 +126,10 @@ where
     crypto_warn_limiter: RateLimiter,
     accept_queue_tx: tokio::sync::mpsc::Sender<Conn<Utp, K, V>>,
     accept_queue_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Conn<Utp, K, V>>>,
+    /// Watch signalling whether any live sub-connections remain (`true` when
+    /// the connection table is empty). Lets a process-scoped dispatcher stop
+    /// once a removed listener's surviving flows have drained.
+    idle: watch::Sender<bool>,
 }
 impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
 where
@@ -167,8 +172,8 @@ where
                 buf.reserve(PACKET_BUFFER_LENGTH);
             },
         );
-        let (accept_queue_tx, accept_queue_rx) =
-            tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAPACITY);
+        let (accept_queue_tx, accept_queue_rx) = tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAPACITY);
+        let (idle, _) = watch::channel(true);
         Self {
             is_utp_connected: utp.peer_addr().is_ok(),
             utp: Arc::new(utp),
@@ -180,6 +185,7 @@ where
             crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
             accept_queue_tx,
             accept_queue_rx: tokio::sync::Mutex::new(accept_queue_rx),
+            idle,
         }
     }
 }
@@ -209,10 +215,7 @@ where
                 Dispatch::Routed => continue,
                 Dispatch::Accepted => {
                     return self.accept_next().await.ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "accept queue closed",
-                        )
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "accept queue closed")
                     })
                 }
             }
@@ -299,7 +302,10 @@ where
 
         let conn = self.conn_from_parts(key, tx, rx, addr);
         match self.accept_queue_tx.try_send(conn) {
-            Ok(_) => Ok(Dispatch::Accepted),
+            Ok(_) => {
+                let _ = self.idle.send(false);
+                Ok(Dispatch::Accepted)
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 // The accept side is not draining its bounded queue; refuse the
                 // new flow rather than buffer unboundedly.
@@ -324,9 +330,23 @@ where
         self.accept_queue_rx.lock().await.recv().await
     }
 
+    /// Non-blocking variant of [`Self::accept_next`] for draining a removed
+    /// listener's accept queue.
+    pub fn try_accept_next(&self) -> Option<Conn<Utp, K, V>> {
+        self.accept_queue_rx.try_lock().ok()?.try_recv().ok()
+    }
+
     /// Snapshot access to the listener's drop/dispatch counters.
     pub fn stats(&self) -> &ListenerStats {
         &self.stats
+    }
+
+    /// Watch signalling whether any live sub-connections remain. The receiver
+    /// starts with the current state and updates to `true` when the last flow
+    /// closes, so a process-scoped dispatcher can stop once a removed
+    /// listener's surviving flows have drained.
+    pub fn idle(&self) -> watch::Receiver<bool> {
+        self.idle.subscribe()
     }
 
     /// This method is intended to open a sub-connection under a connected unreliable transmission socket.
@@ -346,6 +366,7 @@ where
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
         conn_table.insert(conn_key.clone(), tx.clone());
         drop(conn_table);
+        let _ = self.idle.send(false);
         self.stats
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
@@ -364,6 +385,7 @@ where
             conn_key: conn_key.clone(),
             conn_table: self.conn_table.clone(),
             tx,
+            idle: self.idle.clone(),
         };
         let close_token = Arc::new(close_token);
         let read = ConnRead {
