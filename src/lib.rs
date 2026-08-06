@@ -1,10 +1,12 @@
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use core::net::SocketAddr;
 use core::num::NonZeroUsize;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -216,7 +218,7 @@ where
                 Dispatch::Accepted => {
                     return self.accept_next().await.ok_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "accept queue closed")
-                    })
+                    });
                 }
             }
         }
@@ -412,6 +414,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::io::Read;
 
