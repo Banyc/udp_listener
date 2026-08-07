@@ -481,12 +481,14 @@ mod tests {
         let send_msg_2 = b"world";
         let client_recv_msg = Arc::new(tokio::sync::Notify::new());
         let second_accept = Arc::new(tokio::sync::Notify::new());
-        tokio::spawn({
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn({
             let client_recv_msg = client_recv_msg.clone();
             let second_accept = second_accept.clone();
             async move {
                 let mut client = listener.poll_next_conn().await.unwrap();
-                tokio::spawn(async move {
+                let mut reader_tasks = tokio::task::JoinSet::new();
+                reader_tasks.spawn(async move {
                     let msg = client.read_half().read_half().recv().await.unwrap();
                     assert_eq!(msg.as_ref(), send_msg_1);
                     let msg = client.read_half().read_half().recv().await.unwrap();
@@ -496,6 +498,9 @@ mod tests {
                 });
                 listener.poll_next_conn().await.unwrap();
                 second_accept.notify_waiters();
+                while let Some(result) = reader_tasks.join_next().await {
+                    result.unwrap();
+                }
             }
         });
         let client_recv_msg = client_recv_msg.notified();
@@ -516,6 +521,9 @@ mod tests {
 
         client.send(send_msg_1).await.unwrap();
         second_accept.await;
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -550,7 +558,8 @@ mod tests {
         tasks.spawn(async move {
             let server = Arc::new(server);
             let mut conn = server.poll_next_conn().await.unwrap();
-            tokio::spawn({
+            let mut drainer = tokio::task::JoinSet::new();
+            drainer.spawn({
                 let server = server.clone();
                 async move {
                     loop {
@@ -567,7 +576,8 @@ mod tests {
         tasks.spawn(async move {
             let client = Arc::new(client);
             let mut conn = client.register_conn(key).unwrap();
-            tokio::spawn({
+            let mut drainer = tokio::task::JoinSet::new();
+            drainer.spawn({
                 let client = client.clone();
                 async move {
                     loop {
@@ -654,14 +664,15 @@ mod tests {
         // Now that key 0's 1-slot channel holds b"a" and no reader is draining
         // it, a second packet must be dropped as a dispatcher overflow rather
         // than silently folded into the success path.
-        let driver = {
+        let mut driver_tasks = tokio::task::JoinSet::new();
+        driver_tasks.spawn({
             let listener = Arc::clone(&listener);
-            tokio::spawn(async move {
+            async move {
                 loop {
                     let _ = listener.poll_next_conn().await;
                 }
-            })
-        };
+            }
+        });
         client.send(b"b").await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -696,6 +707,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        driver.abort();
+        drop(driver_tasks);
     }
 }
