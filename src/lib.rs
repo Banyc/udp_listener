@@ -418,48 +418,161 @@ where
 mod tests {
     use std::io::Read;
 
-    use bytes::Buf;
+    use bytes::{Buf, BufMut};
     use futures::{future::maybe_done, pin_mut};
+    use std::io::IoSlice;
 
     use super::*;
+
+    /// Deterministic in-memory [`UnreliableTransmit`] double: datagrams are
+    /// handed in through a bounded queue instead of a UDP socket, so dispatch
+    /// timing is driven entirely by the test — no kernel buffers, no
+    /// scheduler races, no timeouts. `peer_addr` reports unconnected, so the
+    /// listener uses `recv_buf_from`, whose per-datagram copy is truncated to
+    /// the destination buffer's remaining capacity exactly like a real socket
+    /// — a shrunken pooled buffer is therefore detected the same way.
+    struct DeterministicTransport {
+        peer: SocketAddr,
+        queue: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    }
+    impl DeterministicTransport {
+        fn new(
+            peer: SocketAddr,
+            queue: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        ) -> Self {
+            Self {
+                peer,
+                queue: tokio::sync::Mutex::new(queue),
+            }
+        }
+        async fn recv_into(&self, buf: &mut impl BufMut) -> std::io::Result<(usize, SocketAddr)> {
+            let (addr, data) = self.queue.lock().await.recv().await.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "queue closed")
+            })?;
+            // Emulate socket truncation: only the buffer's remaining capacity
+            // is filled, so a pooled buffer that shrank below the datagram
+            // size shortens the dispatched body.
+            let n = data.len().min(buf.remaining_mut());
+            buf.put_slice(&data[..n]);
+            Ok((n, addr))
+        }
+    }
+    impl UnreliableTransmit for DeterministicTransport {
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.peer)
+        }
+        fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "deterministic transport is unconnected",
+            ))
+        }
+        async fn recv_buf(&self, buf: &mut impl BufMut) -> std::io::Result<usize> {
+            self.recv_into(buf).await.map(|(n, _)| n)
+        }
+        async fn recv_buf_from(
+            &self,
+            buf: &mut impl BufMut,
+        ) -> std::io::Result<(usize, SocketAddr)> {
+            self.recv_into(buf).await
+        }
+        async fn send(&self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        async fn send_to(&self, _buf: &[u8], _target: &SocketAddr) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        fn try_send(&self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        fn try_send_to(&self, _buf: &[u8], _target: &SocketAddr) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        async fn send_vectored(&self, _bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        async fn send_to_vectored(
+            &self,
+            _bufs: &[IoSlice<'_>],
+            _target: &SocketAddr,
+        ) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no sends",
+            ))
+        }
+        fn supports_send_vectored(&self) -> bool {
+            false
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pooled_buffer_does_not_shrink_across_reuses() {
         const HEADER_LEN: usize = 8_000;
         const PAYLOAD_LEN: usize = 8_192;
         const BODY_LEN: usize = PAYLOAD_LEN - HEADER_LEN;
-        let dispatcher_buffer_size = NonZeroUsize::new(64).unwrap();
-        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let listen_addr = udp.local_addr().unwrap();
-        let dispatch = |addr: &SocketAddr, mut pkt: Packet| {
-            let header_len = HEADER_LEN.min(pkt.len());
-            pkt.advance(header_len);
-            Some((*addr, pkt))
-        };
-        let listener = UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
-        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        client.connect(listen_addr).await.unwrap();
+        const REUSES: usize = 64;
+        let dispatcher_buffer_size = NonZeroUsize::new(REUSES).unwrap();
+
+        // Deterministic transport double: no UDP socket, so the test cannot
+        // be load-sensitive (it previously timed out under concurrent
+        // repository load while racing `poll_next_conn` against a 5 s recv
+        // timeout). Datagrams are queued in memory and dispatch is driven
+        // continuously by a pinned function-scoped future while the pool is
+        // validated separately.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(REUSES + 1);
+        let listener = UtpListener::new(
+            DeterministicTransport::new(addr, rx),
+            dispatcher_buffer_size,
+            Arc::new(|_addr: &SocketAddr, mut pkt: Packet| {
+                let header_len = HEADER_LEN.min(pkt.len());
+                pkt.advance(header_len);
+                Some((*_addr, pkt))
+            }),
+        );
+        let listener = Arc::new(listener);
+
+        // First datagram opens the connection.
         let payload = vec![0xABu8; PAYLOAD_LEN];
-        client.send(&payload).await.unwrap();
+        tx.send((addr, payload.clone())).await.unwrap();
         let mut conn = listener.poll_next_conn().await.unwrap();
         assert_eq!(
             conn.read_half().read_half().recv().await.unwrap().len(),
             BODY_LEN
         );
-        for i in 0..64 {
-            client.send(&payload).await.unwrap();
-            let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                tokio::select! {
-                    _ = listener.poll_next_conn() => None,
-                    pkt = conn.read_half().read_half().recv() => pkt,
-                }
-            })
-            .await
-            .expect("the packet was never dispatched")
+
+        // Continuously drive dispatch with a pinned function-scoped future:
+        // every queued datagram is routed into the connection's channel while
+        // the body validates the pool reuse separately, so the validation
+        // never depends on who wins a poll race.
+        let dispatch_loop = async {
+            loop {
+                let _ = listener.dispatch_next().await;
+            }
+        };
+        tokio::pin!(dispatch_loop);
+        for i in 0..REUSES {
+            tx.send((addr, payload.clone())).await.unwrap();
+            let pkt = tokio::select! {
+                pkt = conn.read_half().read_half().recv() => pkt,
+                _ = &mut dispatch_loop => unreachable!("the dispatch loop never completes"),
+            }
             .expect("the connection was dropped");
             assert_eq!(
                 pkt.len(),
