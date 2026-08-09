@@ -174,7 +174,7 @@ mod tests {
     use core::{net::SocketAddr, num::NonZeroUsize};
     use std::{io::IoSlice, sync::Arc};
 
-    use crate::{Packet, UtpListener};
+    use crate::{Classified, DispatchPolicy, Packet, UtpListener};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dead_connection_does_not_evict_its_successor() {
@@ -229,7 +229,13 @@ mod tests {
             .await
             .unwrap();
         udp.connect(peer.local_addr().unwrap()).await.unwrap();
-        let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((KEY, pkt));
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| {
+            Some(Classified {
+                key: KEY,
+                value: pkt,
+                policy: DispatchPolicy::Create,
+            })
+        };
         let listener: UtpListener<tokio_udp::UdpSocket, u8, Packet> =
             UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
         let (read, write) = listener

@@ -57,6 +57,11 @@ pub struct ListenerStats {
     /// surfaces (e.g. `rtp::keyed_udp::dispatch` rejects an undecodable
     /// datagram); the crate itself has no `CryptoError` type.
     pub packets_dropped_rejected: AtomicU64,
+    /// Datagrams dropped because they were classified [`DispatchPolicy::ExistingOnly`]
+    /// and their key was absent. The datagram is dropped before any channel,
+    /// conntrack entry, or handler task is allocated, so unauthenticated
+    /// continuation-only datagrams cannot force resource allocation.
+    pub packets_dropped_existing_only: AtomicU64,
     /// Datagrams dropped because the sub-connection's dispatcher buffer was full.
     pub packets_dropped_dispatcher_full: AtomicU64,
     /// Datagrams dropped because they filled the whole packet buffer.
@@ -74,6 +79,7 @@ impl ListenerStats {
             packets_received: AtomicU64::new(0),
             packets_dispatched: AtomicU64::new(0),
             packets_dropped_rejected: AtomicU64::new(0),
+            packets_dropped_existing_only: AtomicU64::new(0),
             packets_dropped_dispatcher_full: AtomicU64::new(0),
             packets_dropped_pkt_buf_overflow: AtomicU64::new(0),
             accepts_dropped_queue_full: AtomicU64::new(0),
@@ -108,8 +114,32 @@ impl RateLimiter {
     }
 }
 
+/// Whether a classified datagram may open a new sub-connection when its key
+/// is not yet in the connection table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchPolicy {
+    /// The datagram may open a new sub-connection for an unknown key.
+    Create,
+    /// The datagram may only route to an already-open sub-connection. When
+    /// its key is absent it is dropped before any channel, conntrack entry,
+    /// or handler task is allocated: an unauthenticated continuation-only
+    /// datagram cannot force resource allocation, it can only address a flow
+    /// that already exists.
+    ExistingOnly,
+}
+
+/// A datagram classified by the dispatch closure: the conntrack key it
+/// addresses, the payload handed to that flow, and whether it may create the
+/// flow when the key is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classified<K, V> {
+    pub key: K,
+    pub value: V,
+    pub policy: DispatchPolicy,
+}
+
 pub type Classify<Addr, K, V> =
-    Arc<dyn Fn(&Addr, Packet) -> Option<(K, V)> + Sync + Send + 'static>;
+    Arc<dyn Fn(&Addr, Packet) -> Option<Classified<K, V>> + Sync + Send + 'static>;
 
 pub(crate) type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
 
@@ -152,7 +182,13 @@ where
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(socket: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
-        let dispatch = |addr: &SocketAddr, packet: Packet| Some((*addr, packet));
+        let dispatch = |addr: &SocketAddr, packet: Packet| {
+            Some(Classified {
+                key: *addr,
+                value: packet,
+                policy: DispatchPolicy::Create,
+            })
+        };
         UtpListener::new(socket, dispatcher_buffer_size, Arc::new(dispatch))
     }
 }
@@ -255,7 +291,7 @@ where
             return Ok(Dispatch::Routed);
         }
 
-        let Some((key, mut value)) = (self.dispatch)(&addr, pkt_buf) else {
+        let Some(classified) = (self.dispatch)(&addr, pkt_buf) else {
             self.stats
                 .packets_dropped_rejected
                 .fetch_add(1, Ordering::Relaxed);
@@ -269,6 +305,11 @@ where
             }
             return Ok(Dispatch::Routed);
         };
+        let Classified {
+            key,
+            mut value,
+            policy,
+        } = classified;
 
         let mut conn_table = self.conn_table.lock().unwrap();
 
@@ -288,6 +329,17 @@ where
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => value = v,
             }
+        }
+
+        // The key is absent (or its channel was closed): only a `Create`
+        // datagram may open a new sub-connection. An `ExistingOnly` datagram
+        // is dropped here, before any channel, conntrack entry, or handler
+        // task is allocated, so it cannot force resource allocation.
+        if policy == DispatchPolicy::ExistingOnly {
+            self.stats
+                .packets_dropped_existing_only
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Dispatch::Routed);
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
@@ -543,7 +595,11 @@ mod tests {
             Arc::new(|_addr: &SocketAddr, mut pkt: Packet| {
                 let header_len = HEADER_LEN.min(pkt.len());
                 pkt.advance(header_len);
-                Some((*_addr, pkt))
+                Some(Classified {
+                    key: *_addr,
+                    value: pkt,
+                    policy: DispatchPolicy::Create,
+                })
             }),
         );
         let listener = Arc::new(listener);
@@ -644,12 +700,16 @@ mod tests {
         let key = 42;
         let msg = b"hello world";
         let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
-        let dispatch = |_addr: &SocketAddr, mut packet: Packet| -> Option<(u8, Packet)> {
+        let dispatch = |_addr: &SocketAddr, mut packet: Packet| -> Option<Classified<u8, Packet>> {
             let mut key_buf = [0; 1];
             let mut rdr = std::io::Cursor::new(packet.as_ref());
             rdr.read_exact(&mut key_buf).ok()?;
             packet.advance(1);
-            Some((key_buf[0], packet))
+            Some(Classified {
+                key: key_buf[0],
+                value: packet,
+                policy: DispatchPolicy::Create,
+            })
         };
         let dispatch = Arc::new(dispatch);
 
@@ -723,7 +783,11 @@ mod tests {
                 return None;
             }
             packet.advance(1);
-            Some((*addr, packet))
+            Some(Classified {
+                key: *addr,
+                value: packet,
+                policy: DispatchPolicy::Create,
+            })
         };
         let listener = UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
         let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
@@ -762,7 +826,13 @@ mod tests {
             .await
             .unwrap();
         let listen_addr = udp.local_addr().unwrap();
-        let dispatch = |_addr: &SocketAddr, pkt: Packet| Some((0u8, pkt));
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| {
+            Some(Classified {
+                key: 0u8,
+                value: pkt,
+                policy: DispatchPolicy::Create,
+            })
+        };
         let listener = Arc::new(UtpListener::new(
             udp,
             dispatcher_buffer_size,
@@ -821,5 +891,87 @@ mod tests {
             1
         );
         drop(driver_tasks);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_only_packets_route_but_never_create() {
+        let dispatcher_buffer_size = NonZeroUsize::new(4).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        // Byte 0 marks the datagram as continuation-only (`c`) or creating
+        // (anything else); byte 1 is the flow key.
+        let dispatch = |_addr: &SocketAddr, mut packet: Packet| -> Option<Classified<u8, Packet>> {
+            let mut head = [0; 2];
+            std::io::Read::read_exact(&mut std::io::Cursor::new(packet.as_ref()), &mut head)
+                .ok()?;
+            packet.advance(2);
+            let policy = if head[0] == b'c' {
+                DispatchPolicy::ExistingOnly
+            } else {
+                DispatchPolicy::Create
+            };
+            Some(Classified {
+                key: head[1],
+                value: packet,
+                policy,
+            })
+        };
+        let listener = UtpListener::new(udp, dispatcher_buffer_size, Arc::new(dispatch));
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+
+        // A continuation-only datagram whose key is absent is dropped before
+        // any channel, conntrack entry, or accept task is allocated.
+        client.send(b"c\x01x").await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Routed);
+        assert_eq!(
+            listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::Relaxed),
+            1,
+            "the absent-key existing-only datagram must be dropped"
+        );
+        assert_eq!(
+            listener.stats().connections_opened.load(Ordering::Relaxed),
+            0,
+            "an existing-only datagram must not allocate a sub-connection"
+        );
+
+        // A creating datagram with the same key opens the flow.
+        client.send(b"f\x01hello").await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        let mut conn = listener.accept_next().await.unwrap();
+        assert_eq!(*conn.conn_key(), 1);
+        assert_eq!(
+            conn.read_half().read_half().recv().await.unwrap().as_ref(),
+            b"hello"
+        );
+
+        // The same continuation-only datagram now routes to the live flow
+        // without opening another one.
+        client.send(b"c\x01world").await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Routed);
+        assert_eq!(
+            conn.read_half().read_half().recv().await.unwrap().as_ref(),
+            b"world"
+        );
+        assert_eq!(
+            listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::Relaxed),
+            1,
+            "an existing-key existing-only datagram must route, not drop"
+        );
+        assert_eq!(
+            listener.stats().connections_opened.load(Ordering::Relaxed),
+            1,
+            "an existing-only datagram must never reopen the flow"
+        );
     }
 }
