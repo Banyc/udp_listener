@@ -143,3 +143,102 @@ impl UnreliableTransmit for tokio_udp::UdpSocket {
         tokio_udp::is_vectored_supported()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::IoSlice;
+
+    use crate::UnreliableTransmit;
+
+    /// `tokio::net::UdpSocket` has no vectorized syscall, so its connected
+    /// vectored send concatenates every buffer into one temporary and sends
+    /// them as a single datagram; a fallback that drops all but the first
+    /// buffer would silently truncate the packet.
+    #[tokio::test]
+    async fn tokio_net_udp_connected_vectored_send_concatenates_every_buffer() {
+        let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let b = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        let bufs = [
+            IoSlice::new(b"ab"),
+            IoSlice::new(b"cd"),
+            IoSlice::new(b"ef"),
+        ];
+        assert_eq!(
+            UnreliableTransmit::send_vectored(&a, &bufs).await.unwrap(),
+            6
+        );
+        let mut buf = [0u8; 16];
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcdef");
+
+        // A single buffer takes the direct path.
+        assert_eq!(
+            UnreliableTransmit::send_vectored(&a, &[IoSlice::new(b"x")])
+                .await
+                .unwrap(),
+            1
+        );
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"x");
+
+        // No buffers sends nothing.
+        assert_eq!(UnreliableTransmit::send_vectored(&a, &[]).await.unwrap(), 0);
+    }
+
+    /// The unconnected vectored send concatenates buffers, forwards a single
+    /// buffer directly, and sends nothing for an empty slice list.
+    #[tokio::test]
+    async fn tokio_net_udp_vectored_send_concatenates_every_buffer() {
+        let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let b = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let bufs = [
+            IoSlice::new(b"ab"),
+            IoSlice::new(b"cd"),
+            IoSlice::new(b"ef"),
+        ];
+        assert_eq!(
+            UnreliableTransmit::send_to_vectored(&a, &bufs, &b_addr)
+                .await
+                .unwrap(),
+            6
+        );
+        let mut buf = [0u8; 16];
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcdef");
+
+        assert_eq!(
+            UnreliableTransmit::send_to_vectored(&a, &[IoSlice::new(b"x")], &b_addr)
+                .await
+                .unwrap(),
+            1
+        );
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"x");
+
+        assert_eq!(
+            UnreliableTransmit::send_to_vectored(&a, &[], &b_addr)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Whether a transport can avoid the concatenation fallback is a property
+    /// of its backend: the native socket reports `is_vectored_supported()`, the
+    /// `tokio::net` wrapper never does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supports_send_vectored_matches_the_backend() {
+        let native = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            UnreliableTransmit::supports_send_vectored(&native),
+            tokio_udp::is_vectored_supported()
+        );
+        let net = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        assert!(!UnreliableTransmit::supports_send_vectored(&net));
+    }
+}

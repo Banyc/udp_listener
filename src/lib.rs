@@ -501,10 +501,14 @@ mod tests {
             let (addr, data) = self.queue.lock().await.recv().await.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::ConnectionReset, "queue closed")
             })?;
-            // Emulate socket truncation: only the buffer's remaining capacity
+            // Emulate the socket exactly: only the buffer's *spare capacity*
             // is filled, so a pooled buffer that shrank below the datagram
-            // size shortens the dispatched body.
-            let n = data.len().min(buf.remaining_mut());
+            // size is truncated the same way a real `recv` truncates it.
+            // (`BufMut::remaining_mut` cannot be used: `BytesMut` reports
+            // `isize::MAX - len`, not the spare capacity, so `.min(remaining_mut)`
+            // is a no-op and the truncation would never be emulated.)
+            let spare = buf.chunk_mut().len();
+            let n = data.len().min(spare);
             buf.put_slice(&data[..n]);
             Ok((n, addr))
         }
@@ -594,7 +598,10 @@ mod tests {
             dispatcher_buffer_size,
             Arc::new(|_addr: &SocketAddr, mut pkt: Packet| {
                 let header_len = HEADER_LEN.min(pkt.len());
-                pkt.advance(header_len);
+                // `split_to` (unlike `advance`) shrinks the pooled buffer's
+                // capacity, so the pool's reset path must restore it; this is
+                // the shrink vector the reuse test has to exercise.
+                let _ = pkt.split_to(header_len);
                 Some(Classified {
                     key: *_addr,
                     value: pkt,
@@ -973,5 +980,160 @@ mod tests {
             1,
             "an existing-only datagram must never reopen the flow"
         );
+    }
+
+    /// The overflow branch (`n == PACKET_BUFFER_LENGTH`) cannot fire on a real
+    /// UDP socket: the largest UDP payload (65507 bytes over IPv4, 65527 over
+    /// IPv6) is smaller than `PACKET_BUFFER_LENGTH` (65536), so the pooled
+    /// buffer can never be filled to the brim and `recv` never reports a full
+    /// read. The in-memory transport can deliver exactly
+    /// `PACKET_BUFFER_LENGTH` bytes, which pins the drop/accounting decision
+    /// the kernel path cannot reach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_datagram_that_fills_the_pooled_buffer_is_dropped_as_overflow() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let listener = UtpListener::new_identity_dispatch(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        tx.send((addr, vec![0u8; PACKET_BUFFER_LENGTH]))
+            .await
+            .unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Routed);
+        assert_eq!(
+            listener
+                .stats()
+                .packets_dropped_pkt_buf_overflow
+                .load(Ordering::Relaxed),
+            1,
+            "a full-buffer read must be counted as an overflow drop"
+        );
+        assert_eq!(
+            listener.stats().packets_dispatched.load(Ordering::Relaxed),
+            0,
+            "an overflowing datagram must not be dispatched"
+        );
+        assert_eq!(
+            listener.stats().connections_opened.load(Ordering::Relaxed),
+            0,
+            "an overflowing datagram must not open a flow"
+        );
+    }
+
+    /// The idle watch is the signal a process-scoped dispatcher uses to stop
+    /// once a removed listener's flows have drained: it must go `true` to
+    /// `false` when a flow opens and back to `true` only when the last one
+    /// closes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_watch_tracks_whether_live_connections_remain() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let listener = UtpListener::new_identity_dispatch(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let idle = listener.idle();
+        assert!(*idle.borrow(), "a fresh listener starts idle");
+
+        tx.send((addr, vec![7u8])).await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        assert!(
+            !*idle.borrow(),
+            "an open sub-connection must report not-idle"
+        );
+
+        let conn = listener.accept_next().await.unwrap();
+        drop(conn);
+        assert!(
+            *idle.borrow(),
+            "closing the last sub-connection must report idle again"
+        );
+    }
+
+    /// `try_accept_next` must drain already-queued flows without awaiting and
+    /// report `None` on an empty queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_accept_next_drains_queued_flows_without_blocking() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let listener = UtpListener::new_identity_dispatch(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        assert!(listener.try_accept_next().is_none(), "nothing queued yet");
+        tx.send((addr, vec![1u8])).await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        let conn = listener
+            .try_accept_next()
+            .expect("the queued flow must be drained without awaiting");
+        drop(conn);
+        assert!(listener.try_accept_next().is_none(), "queue drained");
+    }
+
+    /// The accept queue is bounded: `dispatch_next` must refuse (and count)
+    /// the overflow flow rather than block or accept it, so an accept side
+    /// that stops draining cannot grow memory without bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_queue_full_refuses_new_flows() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let total = ACCEPT_QUEUE_CAPACITY + 1;
+        let (tx, rx) = tokio::sync::mpsc::channel(total + 1);
+        // Key each datagram by its leading u16 so every datagram opens a
+        // distinct flow and the accept queue is the only bound that can stop
+        // the loop.
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| -> Option<Classified<u16, Packet>> {
+            let key = u16::from_be_bytes([pkt[0], pkt[1]]);
+            Some(Classified {
+                key,
+                value: pkt,
+                policy: DispatchPolicy::Create,
+            })
+        };
+        let listener = UtpListener::new(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(dispatch),
+        );
+        for i in 0..total {
+            tx.send((addr, (i as u16).to_be_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..total {
+            match listener.dispatch_next().await.unwrap() {
+                Dispatch::Accepted => accepted += 1,
+                Dispatch::Routed => refused += 1,
+            }
+        }
+        assert_eq!(
+            accepted, ACCEPT_QUEUE_CAPACITY,
+            "exactly the accept-queue capacity may be accepted"
+        );
+        assert_eq!(
+            refused, 1,
+            "the overflow flow must be refused, not accepted"
+        );
+        assert_eq!(
+            listener
+                .stats()
+                .accepts_dropped_queue_full
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// The crypto-warning rate limiter must fire on the first call, suppress
+    /// calls inside the cooldown, and fire again after it elapses. An inverted
+    /// comparison would spam the log on every dropped packet.
+    #[test]
+    fn rate_limiter_suppresses_within_the_cooldown() {
+        let limiter = RateLimiter::new(Duration::from_millis(50));
+        assert!(limiter.fire(), "the first call always fires");
+        assert!(!limiter.fire(), "a call inside the cooldown is suppressed");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(limiter.fire(), "a call after the cooldown fires again");
     }
 }

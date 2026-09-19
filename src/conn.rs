@@ -262,4 +262,37 @@ mod tests {
         assert_eq!(dispatched.as_ref(), b"x");
         drop(write);
     }
+
+    /// The write half of a flow opened by an unconnected listener socket must
+    /// send to the recorded peer explicitly (`send_to`/`send_to_vectored`); a
+    /// swapped arm would send on the unconnected socket and fail instead of
+    /// reaching the client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conn_write_vectored_and_try_send_address_the_peer() {
+        let dispatcher_buffer_size = NonZeroUsize::new(2).unwrap();
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let listen_addr = udp.local_addr().unwrap();
+        let listener = UtpListener::new_identity_dispatch(udp, dispatcher_buffer_size);
+        let client = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        client.connect(listen_addr).await.unwrap();
+        client.send(b"open").await.unwrap();
+        let (mut read, write) = listener.poll_next_conn().await.unwrap().split();
+        assert_eq!(read.read_half().recv().await.unwrap().as_ref(), b"open");
+
+        write
+            .send_vectored(&[IoSlice::new(b"ab"), IoSlice::new(b"cd")])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcd");
+
+        assert_eq!(write.try_send(b"ef").unwrap(), 2);
+        let (n, _) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ef");
+    }
 }
