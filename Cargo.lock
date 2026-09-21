@@ -290,6 +290,7 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.4#11f6760a6bd75f8fe09a4321824b3af60bb1b256"
 dependencies = [
  "bytes",
  "socket2",
