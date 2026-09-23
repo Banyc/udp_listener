@@ -3,7 +3,7 @@
 use core::net::SocketAddr;
 use core::num::NonZeroUsize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -13,7 +13,7 @@ use std::{
 
 use bytes::BytesMut;
 use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 mod conn;
 mod transmit;
@@ -156,8 +156,14 @@ where
     dispatch: Classify<SocketAddr, K, V>,
     stats: ListenerStats,
     crypto_warn_limiter: RateLimiter,
-    accept_queue_tx: tokio::sync::mpsc::Sender<Conn<Utp, K, V>>,
-    accept_queue_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Conn<Utp, K, V>>>,
+    /// Newly opened sub-connections waiting for an accept, in open order.
+    ///
+    /// The queue is a plain synchronous structure on purpose: a dequeue must
+    /// be possible without an `await`, so that the enqueue in
+    /// [`Self::dispatch_next`] and the dequeue in [`Self::poll_next_conn`] sit
+    /// in the same poll with no cancellation point between them.
+    accept_queue: Mutex<VecDeque<Conn<Utp, K, V>>>,
+    accept_notify: Notify,
     /// Watch signalling whether any live sub-connections remain (`true` when
     /// the connection table is empty). Lets a process-scoped dispatcher stop
     /// once a removed listener's surviving flows have drained.
@@ -210,7 +216,6 @@ where
                 buf.reserve(PACKET_BUFFER_LENGTH);
             },
         );
-        let (accept_queue_tx, accept_queue_rx) = tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAPACITY);
         let (idle, _) = watch::channel(true);
         Self {
             is_utp_connected: utp.peer_addr().is_ok(),
@@ -221,8 +226,8 @@ where
             dispatch,
             stats: ListenerStats::new(),
             crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
-            accept_queue_tx,
-            accept_queue_rx: tokio::sync::Mutex::new(accept_queue_rx),
+            accept_queue: Mutex::new(VecDeque::new()),
+            accept_notify: Notify::new(),
             idle,
         }
     }
@@ -246,17 +251,26 @@ where
     ///
     /// # Cancel safety
     ///
-    /// This method is cancel safe.
+    /// This method is cancel safe. A connection opened by `dispatch_next` is
+    /// enqueued synchronously before it returns, and this loop drains the
+    /// queue with a synchronous [`Self::try_accept_next`] before it awaits
+    /// again, so no cancellation point lies between an enqueue and a dequeue:
+    /// dropping a call cannot strand a connection behind a datagram that never
+    /// arrives.
     pub async fn poll_next_conn(&self) -> std::io::Result<Conn<Utp, K, V>> {
         loop {
-            match self.dispatch_next().await? {
-                Dispatch::Routed => continue,
-                Dispatch::Accepted => {
-                    return self.accept_next().await.ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "accept queue closed")
-                    });
-                }
+            // Drain a connection already queued — by `dispatch_next`, by the
+            // split dispatch/accept API, or by an earlier call to this method
+            // that was cancelled after the connection was enqueued — before
+            // reading another datagram.
+            if let Some(conn) = self.try_accept_next() {
+                return Ok(conn);
             }
+            // `Routed` and `Accepted` both mean "read the next datagram": a
+            // flow opened by `dispatch_next` is already queued synchronously
+            // by the time it returns, so the loop head drains it without
+            // awaiting and without any window in which it can be lost.
+            let _ = self.dispatch_next().await?;
         }
     }
 
@@ -355,39 +369,50 @@ where
         drop(conn_table);
 
         let conn = self.conn_from_parts(key, tx, rx, addr);
-        match self.accept_queue_tx.try_send(conn) {
-            Ok(_) => {
-                let _ = self.idle.send(false);
-                Ok(Dispatch::Accepted)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        {
+            let mut accept_queue = self.accept_queue.lock().unwrap();
+            if accept_queue.len() >= ACCEPT_QUEUE_CAPACITY {
                 // The accept side is not draining its bounded queue; refuse the
                 // new flow rather than buffer unboundedly.
                 self.stats
                     .accepts_dropped_queue_full
                     .fetch_add(1, Ordering::Relaxed);
-                Ok(Dispatch::Routed)
+                return Ok(Dispatch::Routed);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.stats
-                    .accepts_dropped_queue_full
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(Dispatch::Routed)
+            accept_queue.push_back(conn);
+        }
+        let _ = self.idle.send(false);
+        self.accept_notify.notify_one();
+        Ok(Dispatch::Accepted)
+    }
+
+    /// Receive the next newly opened sub-connection queued by [`Self::dispatch_next`],
+    /// waiting until one is queued.
+    ///
+    /// The accept queue is owned by the listener, so — unlike a channel whose
+    /// senders can be dropped — it has no closed state while this borrow is
+    /// alive: the returned [`Option`] is always `Some`.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe: a cancelled call has either removed a
+    /// connection (and returned it) or removed nothing.
+    pub async fn accept_next(&self) -> Option<Conn<Utp, K, V>> {
+        loop {
+            if let Some(conn) = self.try_accept_next() {
+                return Some(conn);
             }
+            self.accept_notify.notified().await;
         }
     }
 
-    /// Receive the next newly opened sub-connection queued by [`Self::dispatch_next`].
+    /// Non-blocking, non-awaiting variant of [`Self::accept_next`] for draining
+    /// a removed listener's accept queue.
     ///
-    /// Returns `None` when the listener has been dropped (accept queue closed).
-    pub async fn accept_next(&self) -> Option<Conn<Utp, K, V>> {
-        self.accept_queue_rx.lock().await.recv().await
-    }
-
-    /// Non-blocking variant of [`Self::accept_next`] for draining a removed
-    /// listener's accept queue.
+    /// The dequeue takes a plain synchronous lock, so it cannot fail to observe
+    /// a connection that [`Self::dispatch_next`] has already queued.
     pub fn try_accept_next(&self) -> Option<Conn<Utp, K, V>> {
-        self.accept_queue_rx.try_lock().ok()?.try_recv().ok()
+        self.accept_queue.lock().unwrap().pop_front()
     }
 
     /// Snapshot access to the listener's drop/dispatch counters.
@@ -1069,6 +1094,56 @@ mod tests {
             .expect("the queued flow must be drained without awaiting");
         drop(conn);
         assert!(listener.try_accept_next().is_none(), "queue drained");
+    }
+
+    /// A connection already queued by an earlier accept must be returned by the
+    /// very next `poll_next_conn`, on its first poll, without reading another
+    /// datagram.
+    ///
+    /// `dispatch_next()` here models the datagram read of an accept future that
+    /// is then dropped before it drains the queue (the split dispatch/accept
+    /// form, or a `select!` branch recreated every iteration). With no datagram
+    /// left in the transport, a `poll_next_conn` that drained the queue only
+    /// when `dispatch_next` reported a fresh `Accepted` would park forever; the
+    /// deterministic transport makes that park observable as a still-pending
+    /// first poll rather than a wall-clock race.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_connection_is_drained_without_reading_another_datagram() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let listener = UtpListener::new_identity_dispatch(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        tx.send((addr, vec![1u8])).await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        let conn = futures::FutureExt::now_or_never(listener.poll_next_conn())
+            .expect("a queued connection must be drained without another datagram")
+            .expect("draining a queued connection must not error");
+        assert_eq!(*conn.conn_key(), addr);
+    }
+
+    /// The same handover modelled as the caller that actually races it: an
+    /// accept future dropped after its datagram opened a flow, with the accept
+    /// loop resumed later. The queued flow must still be accepted promptly
+    /// instead of waiting for a new source that never arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_queued_by_a_cancelled_accept_is_still_accepted() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let listener = UtpListener::new_identity_dispatch(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        tx.send((addr, b"open".to_vec())).await.unwrap();
+        // Enqueue one connection exactly as an accept does before its queue
+        // drain, then model that accept being dropped by not draining here.
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        let conn = tokio::time::timeout(Duration::from_millis(500), listener.poll_next_conn())
+            .await
+            .expect("a queued connection must be accepted without another datagram")
+            .expect("accepting the queued connection must not error");
+        drop(conn);
     }
 
     /// The accept queue is bounded: `dispatch_next` must refuse (and count)
