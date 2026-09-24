@@ -1215,6 +1215,41 @@ mod tests {
         );
     }
 
+    /// `register_conn` refuses to open a flow it cannot address, or one whose
+    /// key already has a live flow: an unconnected socket has no write
+    /// destination, and a second flow under a live key would take over the
+    /// first flow's datagrams.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_conn_refuses_an_unconnected_socket_and_a_live_key() {
+        let peer_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let loose = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let loose = UtpListener::new_identity_dispatch(loose, NonZeroUsize::new(2).unwrap());
+        assert!(
+            loose.register_conn(peer_addr).is_none(),
+            "an unconnected socket cannot register a flow"
+        );
+
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        udp.connect(peer_addr).await.unwrap();
+        let listener = UtpListener::new_identity_dispatch(udp, NonZeroUsize::new(2).unwrap());
+        let first = listener.register_conn(peer_addr).expect("the key was free");
+        assert!(
+            listener.register_conn(peer_addr).is_none(),
+            "a live flow already holds the key"
+        );
+
+        drop(first);
+        assert!(
+            listener.register_conn(peer_addr).is_some(),
+            "a dead flow's key must be reusable"
+        );
+    }
+
     /// `try_accept_next` must drain already-queued flows without awaiting and
     /// report `None` on an empty queue.
     #[tokio::test(flavor = "multi_thread")]
