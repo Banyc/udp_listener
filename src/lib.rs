@@ -1016,6 +1016,10 @@ mod tests {
             0,
             "an existing-only datagram must not allocate a sub-connection"
         );
+        assert!(
+            listener.conn_table.lock().unwrap().is_empty(),
+            "an existing-only datagram for an absent key must not leave a conntrack entry behind"
+        );
 
         // A creating datagram with the same key opens the flow.
         client.send(b"f\x01hello").await.unwrap();
@@ -1078,6 +1082,11 @@ mod tests {
             "a full-buffer read must be counted as an overflow drop"
         );
         assert_eq!(
+            listener.stats().packets_received.load(Ordering::Relaxed),
+            1,
+            "the overflowing datagram was read, so it must be counted before the drop"
+        );
+        assert_eq!(
             listener.stats().packets_dispatched.load(Ordering::Relaxed),
             0,
             "an overflowing datagram must not be dispatched"
@@ -1116,6 +1125,93 @@ mod tests {
         assert!(
             *idle.borrow(),
             "closing the last sub-connection must report idle again"
+        );
+    }
+
+    /// The idle watch must stay `false` while *any* live sub-connection
+    /// remains: a process-scoped dispatcher that reads `true` as "the removed
+    /// listener's flows have drained, stop" would otherwise stop dispatching
+    /// while another flow's datagrams are still arriving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_watch_stays_not_idle_while_a_live_flow_remains() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // Key by the datagram's leading byte, so one peer address can hold
+        // several live flows at once.
+        let dispatch = |_addr: &SocketAddr, pkt: Packet| -> Option<Classified<u8, Packet>> {
+            Some(Classified {
+                key: pkt[0],
+                value: pkt,
+                policy: DispatchPolicy::Create,
+            })
+        };
+        let listener = UtpListener::new(
+            DeterministicTransport::new(addr, rx),
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(dispatch),
+        );
+        let idle = listener.idle();
+        assert!(*idle.borrow(), "a fresh listener starts idle");
+
+        tx.send((addr, vec![1u8])).await.unwrap();
+        tx.send((addr, vec![2u8])).await.unwrap();
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        assert_eq!(listener.dispatch_next().await.unwrap(), Dispatch::Accepted);
+        let first = listener
+            .try_accept_next()
+            .expect("the first flow is queued");
+        let second = listener
+            .try_accept_next()
+            .expect("the second flow is queued");
+        assert!(!*idle.borrow(), "two live flows must report not-idle");
+
+        drop(first);
+        assert!(
+            !*idle.borrow(),
+            "a live flow remained when the first closed: the listener is not idle"
+        );
+
+        drop(second);
+        assert!(
+            *idle.borrow(),
+            "closing the last live flow must report idle again"
+        );
+    }
+
+    /// `register_conn` opens a sub-connection without a datagram, so it must
+    /// report the same two facts as the dispatch path: the listener is not idle
+    /// while the registered flow lives, and the flow is counted as opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_conn_marks_the_listener_live_and_counts_the_flow() {
+        let udp = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer = tokio_udp::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        // `register_conn` needs a connected socket: it takes the write
+        // destination from `peer_addr`.
+        udp.connect(peer_addr).await.unwrap();
+        let listener = UtpListener::new_identity_dispatch(udp, NonZeroUsize::new(2).unwrap());
+        let idle = listener.idle();
+        assert!(*idle.borrow(), "a fresh listener starts idle");
+
+        let conn = listener.register_conn(peer_addr).expect("the key was free");
+        assert!(
+            !*idle.borrow(),
+            "a registered flow is live, so the listener must report not-idle"
+        );
+        assert_eq!(
+            listener.stats().connections_opened.load(Ordering::Relaxed),
+            1,
+            "a registered flow must be counted as opened"
+        );
+
+        drop(conn);
+        assert!(
+            *idle.borrow(),
+            "closing the registered flow must report idle again"
         );
     }
 
