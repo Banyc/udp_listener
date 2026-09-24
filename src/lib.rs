@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -163,6 +163,15 @@ where
     /// [`Self::dispatch_next`] and the dequeue in [`Self::poll_next_conn`] sit
     /// in the same poll with no cancellation point between them.
     accept_queue: Mutex<VecDeque<Conn<Utp, K, V>>>,
+    /// Length of `accept_queue`, maintained under its lock so that the
+    /// empty-queue turn does not have to take the lock.
+    ///
+    /// It is incremented before an enqueue and decremented after a dequeue, so
+    /// a reader that observes zero has not observed the enqueue's increment —
+    /// the same enqueue a locked read would not have observed yet. The queue
+    /// under the lock stays the authority for contents and capacity; this count
+    /// only decides whether the lock is needed.
+    accept_queue_len: AtomicUsize,
     accept_notify: Notify,
     /// Watch signalling whether any live sub-connections remain (`true` when
     /// the connection table is empty). Lets a process-scoped dispatcher stop
@@ -227,6 +236,7 @@ where
             stats: ListenerStats::new(),
             crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
             accept_queue: Mutex::new(VecDeque::new()),
+            accept_queue_len: AtomicUsize::new(0),
             accept_notify: Notify::new(),
             idle,
         }
@@ -379,6 +389,9 @@ where
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(Dispatch::Routed);
             }
+            // Publish the length before the connection, so a dequeue that
+            // reads zero cannot have observed this enqueue's commit point.
+            self.accept_queue_len.fetch_add(1, Ordering::Release);
             accept_queue.push_back(conn);
         }
         let _ = self.idle.send(false);
@@ -409,10 +422,21 @@ where
     /// Non-blocking, non-awaiting variant of [`Self::accept_next`] for draining
     /// a removed listener's accept queue.
     ///
-    /// The dequeue takes a plain synchronous lock, so it cannot fail to observe
-    /// a connection that [`Self::dispatch_next`] has already queued.
+    /// The dequeue is synchronous, so a caller that has itself enqueued a
+    /// connection observes it; a caller racing an enqueue on another task is
+    /// woken by that enqueue's `notify_one` in [`Self::accept_next`].
     pub fn try_accept_next(&self) -> Option<Conn<Utp, K, V>> {
-        self.accept_queue.lock().unwrap().pop_front()
+        // The overwhelmingly common turn finds an empty queue and must not pay
+        // for the mutex.
+        if self.accept_queue_len.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut accept_queue = self.accept_queue.lock().unwrap();
+        let conn = accept_queue.pop_front();
+        if conn.is_some() {
+            self.accept_queue_len.fetch_sub(1, Ordering::Release);
+        }
+        conn
     }
 
     /// Snapshot access to the listener's drop/dispatch counters.
