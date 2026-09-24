@@ -18,6 +18,9 @@ use tokio::sync::{Notify, watch};
 mod conn;
 mod transmit;
 
+#[cfg(test)]
+mod accept_queue_soak;
+
 use conn::ConnCloseToken;
 pub use conn::{Conn, ConnRead, ConnWrite};
 pub use transmit::UnreliableTransmit;
@@ -266,21 +269,37 @@ where
     /// queue with a synchronous [`Self::try_accept_next`] before it awaits
     /// again, so no cancellation point lies between an enqueue and a dequeue:
     /// dropping a call cannot strand a connection behind a datagram that never
-    /// arrives.
+    /// arrives. A connection enqueued by a *different* task is handed back by
+    /// the accept-queue arm of the wait below, so it does not need this task to
+    /// read another datagram either.
     pub async fn poll_next_conn(&self) -> std::io::Result<Conn<Utp, K, V>> {
         loop {
-            // Drain a connection already queued — by `dispatch_next`, by the
-            // split dispatch/accept API, or by an earlier call to this method
+            // Drain a connection already queued — by this task, by another
+            // task's `dispatch_next`, or by an earlier call to this method
             // that was cancelled after the connection was enqueued — before
             // reading another datagram.
             if let Some(conn) = self.try_accept_next() {
                 return Ok(conn);
             }
-            // `Routed` and `Accepted` both mean "read the next datagram": a
-            // flow opened by `dispatch_next` is already queued synchronously
-            // by the time it returns, so the loop head drains it without
-            // awaiting and without any window in which it can be lost.
-            let _ = self.dispatch_next().await?;
+            // A flow this task opens is queued synchronously before
+            // `dispatch_next` returns, so the loop head above drains it
+            // without awaiting. A flow opened by a *different* task is queued
+            // without this task's datagram read ever completing, so waiting on
+            // the read alone would leave that flow queued until some later
+            // datagram happened to arrive — indefinitely, once the dialling
+            // side goes quiet. Waiting on the accept queue as well makes the
+            // handover independent of who reads the next datagram.
+            tokio::select! {
+                biased;
+                conn = self.accept_next() => {
+                    if let Some(conn) = conn {
+                        return Ok(conn);
+                    }
+                }
+                datagram = self.dispatch_next() => {
+                    datagram?;
+                }
+            }
         }
     }
 
