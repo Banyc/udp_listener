@@ -9,6 +9,7 @@ primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
 tokio = { version = "1", features = [
     "bytes",
     "io-util",
+    "macros",
     "net",
     "sync",
     "time",
