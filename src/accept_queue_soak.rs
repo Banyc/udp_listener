@@ -8,6 +8,11 @@
 //! error anywhere. Those tests drive the queue to its bound and across it, and
 //! check the counter against the queue after every step.
 //!
+//! The ordering test below asserts the enqueue's *commit-before-wake* order:
+//! the queue's two mutations happen under its lock and the wake follows both, so
+//! a woken waiter can always read the committed flow — a wake delivered before
+//! the commit would let it read an empty queue and park again.
+//!
 //! The wakeup tests below assert the *liveness* side of the same queue: an
 //! await on [`accept_next`] is woken only by the enqueue's `notify_one`, and a
 //! `Notify` holds at most one permit, so a wake consumed by a waiter that never
@@ -25,10 +30,10 @@ use std::{
     collections::VecDeque,
     io::IoSlice,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, TryLockError, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::Poll,
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
@@ -40,8 +45,9 @@ use crate::{
 type Listener = UtpListener<tokio_udp::UdpSocket, u64, Packet>;
 
 /// The counter and the queue are two views of one fact; at a quiescent point
-/// they must agree exactly.
-fn assert_queue_consistent<Utp, K, V>(listener: &UtpListener<Utp, K, V>)
+/// they must agree exactly. Shared with the teardown cells, because a drain
+/// that leaves the counter and the queue disagreeing strands a queued flow.
+pub(crate) fn assert_queue_consistent<Utp, K, V>(listener: &UtpListener<Utp, K, V>)
 where
     Utp: UnreliableTransmit,
 {
@@ -455,7 +461,7 @@ fn gated_listener(transport: GatedTransport) -> GatedListener {
     UtpListener::new(transport, NonZeroUsize::new(4).unwrap(), Arc::new(dispatch))
 }
 
-fn wake_env(name: &str, default: usize) -> usize {
+pub(crate) fn wake_env(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(raw) => raw
             .parse::<usize>()
@@ -670,6 +676,128 @@ async fn a_burst_enqueued_before_any_waiter_is_handed_back_once_and_in_bound() {
             (0..items).collect::<Vec<_>>(),
             "{label}: the burst did not come back exactly once per dial"
         );
+    }
+}
+
+/// A waker that snapshots the accept queue at the instant the wake is
+/// delivered, so the enqueue's ordering (commit before notify) is *observable*
+/// rather than argued.
+///
+/// The waker is the instrument an inline-running executor would put in place of
+/// a scheduler: it runs synchronously inside the enqueue's `notify_one`, so what
+/// it reads is exactly what a waiter whose waker polls immediately — or a
+/// cross-task `try_accept_next` that runs right then — would observe. A wake
+/// delivered before the commit point would let such a waiter read an empty
+/// queue, park again, and never be woken by that enqueue.
+struct CommitWaker {
+    /// Weak, so the instrument cannot itself keep the listener alive.
+    listener: Weak<GatedListener>,
+    wakes: AtomicUsize,
+    /// The accept queue's length counter when the wake was delivered.
+    counter_at_wake: AtomicUsize,
+    /// The queue's length when the wake was delivered, or `usize::MAX` if the
+    /// queue could not be read.
+    queue_len_at_wake: AtomicUsize,
+    /// Whether the wake was delivered while the enqueue still held the queue.
+    queue_locked_at_wake: AtomicBool,
+}
+impl CommitWaker {
+    fn new(listener: Weak<GatedListener>) -> Self {
+        Self {
+            listener,
+            wakes: AtomicUsize::new(0),
+            counter_at_wake: AtomicUsize::new(usize::MAX),
+            queue_len_at_wake: AtomicUsize::new(usize::MAX),
+            queue_locked_at_wake: AtomicBool::new(false),
+        }
+    }
+    fn record(&self) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        let Some(listener) = self.listener.upgrade() else {
+            return;
+        };
+        self.counter_at_wake.store(
+            listener.accept_queue_len.load(Ordering::Acquire),
+            Ordering::SeqCst,
+        );
+        match listener.accept_queue.try_lock() {
+            Ok(queue) => {
+                self.queue_len_at_wake.store(queue.len(), Ordering::SeqCst);
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.queue_locked_at_wake.store(true, Ordering::SeqCst);
+            }
+            Err(TryLockError::Poisoned(_)) => {}
+        }
+    }
+}
+impl Wake for CommitWaker {
+    fn wake(self: Arc<Self>) {
+        self.record();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.record();
+    }
+}
+
+/// The enqueue must be **committed before the wake is delivered**.
+///
+/// `dispatch_next` publishes the queue length before pushing the connection, and
+/// notifies only after both, with the queue lock released. A wake delivered
+/// earlier — announcing the reservation rather than the commit — can be polled
+/// inline by an executor whose waker runs immediately, and the woken waiter
+/// would find an empty queue, park again, and not be woken by that enqueue:
+/// a flow queued with no further event to deliver it. The wait's queue check at
+/// its loop head recovers from a wake that arrives *late*; nothing recovers from
+/// one that arrives *early*.
+///
+/// The waker's snapshot is the assertion: at the instant the parked waiter is
+/// woken, the queue must already hold the flow and must not still be locked by
+/// the enqueue.
+#[tokio::test(flavor = "current_thread")]
+async fn the_accept_queue_is_committed_before_the_wake_is_delivered() {
+    const KEY: u64 = 3;
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let transport = GatedTransport::new(addr);
+    let listener = Arc::new(gated_listener(transport.clone()));
+    let mut waiter = Box::pin(listener.accept_next());
+    let probe = Arc::new(CommitWaker::new(Arc::downgrade(&listener)));
+    let waker = Waker::from(Arc::clone(&probe));
+    let mut context = Context::from_waker(&waker);
+    assert!(
+        waiter.as_mut().poll(&mut context).is_pending(),
+        "the waiter must park on the empty queue, or its wake is not the one observed"
+    );
+
+    open_flow(&transport, &listener, addr, KEY).await;
+
+    assert_eq!(
+        probe.wakes.load(Ordering::SeqCst),
+        1,
+        "the enqueue delivered no wake to the parked waiter, so the ordering cannot be observed"
+    );
+    assert_eq!(
+        probe.counter_at_wake.load(Ordering::SeqCst),
+        1,
+        "the wake was delivered before the enqueued flow was counted: a waiter polled at that \
+         instant would read an empty queue and park again"
+    );
+    assert!(
+        !probe.queue_locked_at_wake.load(Ordering::SeqCst),
+        "the wake was delivered while the enqueue still held the accept queue: an executor whose \
+         waker runs inline would run the woken waiter inside the enqueue's critical section"
+    );
+    assert_eq!(
+        probe.queue_len_at_wake.load(Ordering::SeqCst),
+        1,
+        "the accept queue did not hold the flow at the instant the waiter was woken"
+    );
+    match waiter.as_mut().poll(&mut context) {
+        Poll::Ready(Some(conn)) => assert_eq!(*conn.conn_key(), KEY),
+        Poll::Ready(None) => panic!("the awakened waiter returned None"),
+        Poll::Pending => panic!(
+            "the awakened waiter parked again although the wake was delivered after the commit"
+        ),
     }
 }
 
