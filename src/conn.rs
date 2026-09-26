@@ -41,7 +41,10 @@ where
         if is_still_ours {
             conn_table.remove(&self.conn_key);
             if conn_table.is_empty() {
-                let _ = self.idle.send(true);
+                // `send_replace`, not `send`: with no receiver subscribed a
+                // `send` drops the value, hiding the close from the next
+                // subscriber.
+                self.idle.send_replace(true);
             }
         }
     }

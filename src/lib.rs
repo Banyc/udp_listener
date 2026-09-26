@@ -20,6 +20,8 @@ mod transmit;
 
 #[cfg(test)]
 mod accept_queue_soak;
+#[cfg(test)]
+mod teardown_soak;
 
 use conn::ConnCloseToken;
 pub use conn::{Conn, ConnRead, ConnWrite};
@@ -179,6 +181,12 @@ where
     /// Watch signalling whether any live sub-connections remain (`true` when
     /// the connection table is empty). Lets a process-scoped dispatcher stop
     /// once a removed listener's surviving flows have drained.
+    ///
+    /// The state is published with [`watch::Sender::send_replace`], never
+    /// `send`: a `send` with no receiver subscribed does not make its value
+    /// available to future receivers, so a subscriber that arrives after the
+    /// state changed — a drain armed when the listener is removed — would read
+    /// the stale state and either stop dispatching live flows or never stop.
     idle: watch::Sender<bool>,
 }
 impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
@@ -413,7 +421,7 @@ where
             self.accept_queue_len.fetch_add(1, Ordering::Release);
             accept_queue.push_back(conn);
         }
-        let _ = self.idle.send(false);
+        let _ = self.idle.send_replace(false);
         self.accept_notify.notify_one();
         Ok(Dispatch::Accepted)
     }
@@ -488,7 +496,7 @@ where
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
         conn_table.insert(conn_key.clone(), tx.clone());
         drop(conn_table);
-        let _ = self.idle.send(false);
+        self.idle.send_replace(false);
         self.stats
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
