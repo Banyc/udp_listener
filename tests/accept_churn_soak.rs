@@ -698,11 +698,18 @@ async fn run_dialers(
         echoed.extend(report.echoed);
         failures.extend(report.failures);
     }
-    assert_eq!(
-        sent.len(),
-        soak.dialers as usize * soak.iterations as usize,
-        "the batch did not dial every token"
-    );
+    // A dialer stops at its first failure, so a short `sent` means a dial was
+    // not answered — the failure `Batch::violations` reports with its token,
+    // and which must not be pre-empted here by a bare count assertion that
+    // reads like the harness lost the dial. The expected count is only a
+    // harness self-check, so it is asserted solely when no dial failed.
+    if failures.is_empty() {
+        assert_eq!(
+            sent.len(),
+            soak.dialers as usize * soak.iterations as usize,
+            "no dial failed, yet the batch did not dial every token"
+        );
+    }
     (sent, echoed, failures)
 }
 
