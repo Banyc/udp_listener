@@ -519,6 +519,18 @@ impl Batch {
 
     fn violations(&self) -> Vec<String> {
         let mut problems = Vec::new();
+        // The batch's whole verdict is a comparison over the dialled set: with
+        // nothing dialled, every check below is vacuously true, the counters are
+        // all zero, and the arm reports success for a fixture scaled to zero
+        // dials (SOAK_DIALERS/SOAK_ITERATIONS). A soak that dialled nothing has
+        // no verdict to give, so the empty batch is a violation of its own.
+        if self.sent.is_empty() {
+            problems.push(
+                "the batch dialled no token, so its verdict is vacuous: raise SOAK_DIALERS/\
+                 SOAK_ITERATIONS"
+                    .to_string(),
+            );
+        }
         for failure in &self.dial_failures {
             problems.push(failure.to_string());
         }
