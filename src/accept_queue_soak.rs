@@ -26,6 +26,7 @@
 use bytes::BufMut;
 use core::net::SocketAddr;
 use core::num::NonZeroUsize;
+use core::pin::Pin;
 use std::{
     collections::VecDeque,
     io::IoSlice,
@@ -38,7 +39,7 @@ use std::{
 };
 
 use crate::{
-    ACCEPT_QUEUE_CAPACITY, Classified, Classify, Dispatch, DispatchPolicy, Packet,
+    ACCEPT_QUEUE_CAPACITY, Classified, Classify, Conn, Dispatch, DispatchPolicy, Packet,
     UnreliableTransmit, UtpListener,
 };
 
@@ -542,6 +543,116 @@ async fn m_parked_waiters_and_more_enqueues_than_waiters_lose_no_flow() {
         "the parked waiters did not hand back every enqueued flow exactly once"
     );
     assert_queue_consistent(&listener);
+}
+
+/// The surviving waiter must hand back the queued flow. Its own readiness is
+/// not the evidence — a re-polled waiter recovers through the queue check at its
+/// loop head whatever the notify did — so this only checks that the flow the
+/// cancelled waiter left behind is still deliverable.
+fn assert_hands_back<F>(waiter: &mut Pin<Box<F>>, waker: &Waker, expected: u64)
+where
+    F: core::future::Future<Output = Option<Conn<GatedTransport, u64, Packet>>>,
+{
+    match waiter.as_mut().poll(&mut Context::from_waker(waker)) {
+        Poll::Ready(Some(conn)) => assert_eq!(*conn.conn_key(), expected),
+        Poll::Ready(None) => panic!("the surviving waiter returned None"),
+        Poll::Pending => panic!(
+            "the surviving waiter stayed parked although it was woken and the flow is queued"
+        ),
+    }
+}
+
+/// A waker that counts the wakes it receives, so a *delivery* can be asserted
+/// separately from the wait's outcome: a parked waiter that is polled again will
+/// find a queued flow through its loop-head check whatever the notify did, so
+/// only the wake count can tell a delivered wake from a lost one.
+struct WakeCounter(Arc<AtomicUsize>);
+
+/// A waker that counts the wakes it receives, with the counter it reports them
+/// to. The count is what distinguishes a delivered wake from a lost one.
+fn counting_waker() -> (Arc<AtomicUsize>, Waker) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&count))));
+    (count, waker)
+}
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A wake consumed by a waiter that is then cancelled must reach another parked
+/// waiter, not vanish with it.
+///
+/// `notify_one` wakes exactly one waiter and stores no permit when one *is*
+/// registered, so an acceptor that is woken by an enqueue and then dropped
+/// before it polls — a `select!` arm that loses to another arm, which is what
+/// the cancellation modes and every caller's teardown race do — would consume
+/// the queued flow's only wake. The flow would still be queued, so nothing
+/// reports an error: the accept side would simply wait for an event that has
+/// already been spent.
+///
+/// The wake count is the assertion (a re-polled waiter recovers through its
+/// queue check regardless, so the wait's outcome alone cannot see this): after
+/// the cancel, the surviving parked waiter's waker must have fired.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancelled_waiter_does_not_consume_another_waiter_wake() {
+    const KEY: u64 = 11;
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let transport = GatedTransport::new(addr);
+    let listener = gated_listener(transport.clone());
+    let (first_wakes, first_waker) = counting_waker();
+    let (second_wakes, second_waker) = counting_waker();
+    let mut first = Box::pin(listener.accept_next());
+    let mut second = Box::pin(listener.accept_next());
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&first_waker))
+            .is_pending(),
+        "the first waiter must park"
+    );
+    assert!(
+        second
+            .as_mut()
+            .poll(&mut Context::from_waker(&second_waker))
+            .is_pending(),
+        "the second waiter must park"
+    );
+
+    open_flow(&transport, &listener, addr, KEY).await;
+
+    let first_count = first_wakes.load(Ordering::SeqCst);
+    let second_count = second_wakes.load(Ordering::SeqCst);
+    assert_eq!(
+        first_count + second_count,
+        1,
+        "the enqueue must deliver exactly one wake: two would not exercise the cancelled \
+         waiter and none would mean nothing was delivered to cancel"
+    );
+    // Cancel the woken waiter without polling it, and check the survivor.
+    if first_count == 1 {
+        drop(first);
+        assert!(
+            second_wakes.load(Ordering::SeqCst) >= 1,
+            "the cancelled waiter kept the only wake: the surviving waiter is parked, the flow \
+             is still queued ({} queued), and that enqueue's wake has been spent",
+            listener.accept_queue_len.load(Ordering::Acquire)
+        );
+        assert_hands_back(&mut second, &second_waker, KEY);
+    } else {
+        drop(second);
+        assert!(
+            first_wakes.load(Ordering::SeqCst) >= 1,
+            "the cancelled waiter kept the only wake: the surviving waiter is parked, the flow \
+             is still queued ({} queued), and that enqueue's wake has been spent",
+            listener.accept_queue_len.load(Ordering::Acquire)
+        );
+        assert_hands_back(&mut first, &first_waker, KEY);
+    }
 }
 
 /// One burst-before-registration round: open `items` flows with no waiter
