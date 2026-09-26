@@ -941,14 +941,33 @@ async fn accept_queue_at_its_bound_accounts_for_every_flow() {
     .await;
 
     // Wait until every dial has been read and has reached its dispatch or drop
-    // path, so the refusal count is final before it is read.
+    // path, so the refusal count is final before it is read. A blast larger
+    // than the listener's receive buffer can hold is dropped by the kernel, so
+    // report the counters rather than only the elapse: a short `received`
+    // count is a blast that outgrew the buffer (resize the phase), while a
+    // short `accounted` count against a full `received` is a datagram that
+    // reached the listener and no dispatch or drop path took it.
     tokio::time::timeout(Duration::from_secs(30), async {
         while !dispatch_settled(&server, sent.len()) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the dispatch loop did not process every dial");
+    .unwrap_or_else(|_| {
+        let stats = snapshot(&server);
+        let accounted = stats.packets_dispatched
+            + stats.packets_dropped_rejected
+            + stats.packets_dropped_existing_only
+            + stats.packets_dropped_dispatcher_full
+            + stats.packets_dropped_pkt_buf_overflow;
+        panic!(
+            "the dispatch loop did not settle within the bound: {} of {} dials were received, \
+             and {} datagram(s) reached no dispatch or drop path",
+            stats.packets_received,
+            sent.len(),
+            stats.packets_received as i64 - accounted as i64,
+        )
+    });
     let refused_before_accepting = snapshot(&server).accepts_dropped_queue_full;
 
     // Now let the accept side drain what was queued.
