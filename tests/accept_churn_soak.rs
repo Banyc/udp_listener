@@ -338,8 +338,11 @@ async fn dispatch_loop(server: Arc<Server>) {
 }
 
 /// One dialer: its own socket, its own sequence of unique tokens. On the
-/// first failure it stops rather than continuing, so a late echo cannot be
-/// misread as the answer to the next dial.
+/// first failure it stops dialling rather than continuing, so a late echo
+/// cannot be misread as the answer to the next dial. It keeps arriving at the
+/// round barrier while it does so: the barrier counts participants, so a
+/// dialer that left would strand every other dialer at the next round and a
+/// batch that lost one dial would hang instead of reporting it.
 async fn dialer(
     soak: Soak,
     id: u32,
@@ -348,9 +351,13 @@ async fn dialer(
     plan: DialPlan,
 ) -> DialerReport {
     let mut report = DialerReport::default();
+    let mut dialling = true;
     for i in 0..soak.iterations {
         if let Some(barrier) = &plan.barrier {
             barrier.wait().await;
+        }
+        if !dialling {
+            continue;
         }
         let dialled = token(id, i);
         if let Err(err) = socket.send_to(&dialled.to_be_bytes(), listen).await {
@@ -358,7 +365,8 @@ async fn dialer(
                 token: dialled,
                 detail: format!("send: {err}"),
             });
-            break;
+            dialling = false;
+            continue;
         }
         report.sent.push(dialled);
         if splitmix(soak.seed ^ dialled).is_multiple_of(4) {
@@ -374,20 +382,21 @@ async fn dialer(
                 report
                     .failures
                     .push(DialFailure::Unanswered { token: dialled });
-                break;
+                dialling = false;
             }
             Ok(Err(failure)) => {
                 report.failures.push(failure);
-                break;
+                dialling = false;
             }
             Ok(Ok(got)) => {
                 if got != dialled {
                     report
                         .failures
                         .push(DialFailure::WrongToken { sent: dialled, got });
-                    break;
+                    dialling = false;
+                } else {
+                    report.echoed.push(got);
                 }
-                report.echoed.push(got);
             }
         }
     }
@@ -1014,4 +1023,88 @@ async fn accept_queue_at_its_bound_accounts_for_every_flow() {
         server.listener.try_accept_next().is_none(),
         "the accept queue still held a flow after every dial was handed back"
     );
+}
+
+/// A dialer that stops after a failed dial must keep arriving at the round
+/// barrier.
+///
+/// The barrier counts participants, not dialers: a dialer that leaves after
+/// its first unanswered dial strands every other dialer at the next round, so
+/// a batch that lost one dial would hang forever instead of reporting which
+/// dial was never answered. The dialer here that dials a bound-but-silent
+/// socket therefore fails, and the dialer running against the live listener
+/// must still finish every round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_dialer_does_not_strand_the_other_round_participants() {
+    let soak = Soak {
+        dialers: 2,
+        iterations: 2,
+        seed: 1,
+        acceptors: 1,
+        dial_timeout: Duration::from_millis(200),
+    };
+    let server = Arc::new(Server::new().await);
+    let mut accept_tasks = JoinSet::new();
+    spawn_acceptors(
+        &mut accept_tasks,
+        &server,
+        soak,
+        Topology::Split {
+            pace: Duration::ZERO,
+            cancel: None,
+        },
+    );
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    let listen_addr = server.listen_addr;
+    let sockets = dialer_sockets(soak.dialers).await;
+    let plan = DialPlan {
+        wait_for_echo: true,
+        barrier: Some(Arc::new(tokio::sync::Barrier::new(soak.dialers as usize))),
+    };
+    let mut tasks = JoinSet::new();
+    let rejected_socket = Arc::clone(&sockets[0]);
+    let answered_socket = Arc::clone(&sockets[1]);
+    let rejected_plan = plan.clone();
+    tasks.spawn(async move {
+        (
+            0u32,
+            dialer(soak, 0, rejected_socket, silent_addr, rejected_plan).await,
+        )
+    });
+    tasks.spawn(async move {
+        (
+            1u32,
+            dialer(soak, 1, answered_socket, listen_addr, plan).await,
+        )
+    });
+    let reports = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut reports = BTreeMap::new();
+        while let Some(result) = tasks.join_next().await {
+            let (id, report) = result.expect("a dialer task panicked");
+            reports.insert(id, report);
+        }
+        reports
+    })
+    .await
+    .expect("a failed dialer stranded the other round barrier participants: the round hung");
+    let rejected = &reports[&0];
+    let answered = &reports[&1];
+    assert!(
+        !rejected.failures.is_empty(),
+        "the dialer pointed at a silent socket must report an unanswered dial"
+    );
+    assert_eq!(
+        answered.echoed.len(),
+        soak.iterations as usize,
+        "the dialer against the live listener must complete every round"
+    );
+    assert!(
+        answered.failures.is_empty(),
+        "the live dialer failed: {:#?}",
+        answered.failures
+    );
+    drop(socket);
+    stop_accept_side(&server, &mut accept_tasks).await;
 }
