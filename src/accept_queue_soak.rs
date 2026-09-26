@@ -1,14 +1,22 @@
-//! Capacity-boundary and counter-consistency checks for the accept queue.
+//! Capacity-boundary, counter-consistency and accept-wakeup liveness checks.
 //!
-//! These live inside the crate because the queue bound and the lock-free
-//! length counter are private: the boundary is only assertable where the
-//! `VecDeque` and the counter can be read together. [`try_accept_next`] treats
-//! a zero counter as "the queue is empty", so the counter must never read low:
-//! a read of zero while a flow is queued strands that flow with no error
-//! anywhere. The tests here drive the queue to its bound and across it, and
+//! The capacity tests live inside the crate because the queue bound and the
+//! lock-free length counter are private: the boundary is only assertable where
+//! the `VecDeque` and the counter can be read together. [`try_accept_next`]
+//! treats a zero counter as "the queue is empty", so the counter must never
+//! read low: a read of zero while a flow is queued strands that flow with no
+//! error anywhere. Those tests drive the queue to its bound and across it, and
 //! check the counter against the queue after every step.
 //!
+//! The wakeup tests below assert the *liveness* side of the same queue: an
+//! await on [`accept_next`] is woken only by the enqueue's `notify_one`, and a
+//! `Notify` holds at most one permit, so a wake consumed by a waiter that never
+//! takes the flow — or by a waiter that is cancelled — leaves the flow queued
+//! with no error anywhere. Each wakeup test therefore drives one interleaving
+//! and asserts the flow still comes back, which is what a lost wake violates.
+//!
 //! [`try_accept_next`]: crate::UtpListener::try_accept_next
+//! [`accept_next`]: crate::UtpListener::accept_next
 
 use bytes::BufMut;
 use core::net::SocketAddr;
@@ -16,8 +24,12 @@ use core::num::NonZeroUsize;
 use std::{
     collections::VecDeque,
     io::IoSlice,
-    sync::{Arc, Mutex, atomic::Ordering},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::Poll,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -29,7 +41,10 @@ type Listener = UtpListener<tokio_udp::UdpSocket, u64, Packet>;
 
 /// The counter and the queue are two views of one fact; at a quiescent point
 /// they must agree exactly.
-fn assert_queue_consistent(listener: &Listener) {
+fn assert_queue_consistent<Utp, K, V>(listener: &UtpListener<Utp, K, V>)
+where
+    Utp: UnreliableTransmit,
+{
     let queued = listener.accept_queue.lock().unwrap().len();
     let counted = listener.accept_queue_len.load(Ordering::Acquire);
     assert_eq!(
@@ -418,5 +433,280 @@ async fn a_flow_enqueued_by_a_concurrent_dispatch_wakes_the_combined_accept() {
         *conn.conn_key(),
         KEY,
         "the combined accept loop handed back the wrong flow"
+    );
+}
+
+// ===== accept-wakeup liveness =====
+
+/// A listener over the gated in-memory transport, keyed by an 8-byte payload
+/// so a flow can be opened without a UDP socket: the wakeup cells are about
+/// the accept queue's notify, and a real socket adds only port churn and
+/// load-sensitivity to that.
+type GatedListener = UtpListener<GatedTransport, u64, Packet>;
+
+fn gated_listener(transport: GatedTransport) -> GatedListener {
+    let dispatch = |_addr: &SocketAddr, pkt: Packet| -> Option<Classified<u64, Packet>> {
+        Some(Classified {
+            key: u64::from_be_bytes(pkt.as_ref().try_into().ok()?),
+            value: pkt,
+            policy: DispatchPolicy::Create,
+        })
+    };
+    UtpListener::new(transport, NonZeroUsize::new(4).unwrap(), Arc::new(dispatch))
+}
+
+fn wake_env(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .unwrap_or_else(|err| panic!("{name}={raw:?} is not parseable: {err}")),
+        Err(_) => default,
+    }
+}
+
+/// Open one flow: hand the transport the key's datagram, then dispatch it.
+async fn open_flow(
+    transport: &GatedTransport,
+    listener: &GatedListener,
+    addr: SocketAddr,
+    key: u64,
+) {
+    transport.push(addr, key.to_be_bytes().to_vec());
+    assert_eq!(
+        listener.dispatch_next().await.unwrap(),
+        Dispatch::Accepted,
+        "dial {key} did not open a flow"
+    );
+}
+
+/// M waiters parked on an empty queue, then N > M enqueues.
+///
+/// A `Notify` holds at most one permit, so the M enqueues that arrive while
+/// the waiters are registered wake M distinct waiters and everything after
+/// that leaves at most one permit — the surplus flows reach the accept side
+/// only because a woken waiter's caller re-checks the queue at its loop head.
+/// Two properties are pinned here, and they are different claims:
+///
+/// - every waiter that parked is woken (a parked waiter is never served
+///   otherwise, and its caller waits forever); and
+/// - every flow comes back exactly once, whatever the permit accounting did —
+///   which is why the surplus must not be assumed to ride the permit.
+#[tokio::test(flavor = "current_thread")]
+async fn m_parked_waiters_and_more_enqueues_than_waiters_lose_no_flow() {
+    const WAITERS: usize = 4;
+    const ENQUEUES: u64 = 9;
+    assert!(WAITERS as u64 <= ENQUEUES);
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let transport = GatedTransport::new(addr);
+    let listener = gated_listener(transport.clone());
+
+    let mut waiters: Vec<_> = (0..WAITERS)
+        .map(|_| Box::pin(listener.accept_next()))
+        .collect();
+    for (i, waiter) in waiters.iter_mut().enumerate() {
+        assert!(
+            futures::poll!(waiter.as_mut()).is_pending(),
+            "waiter {i} did not park on the empty queue"
+        );
+    }
+
+    for key in 0..ENQUEUES {
+        open_flow(&transport, &listener, addr, key).await;
+    }
+
+    let mut handed = Vec::new();
+    for (i, waiter) in waiters.iter_mut().enumerate() {
+        match futures::poll!(waiter.as_mut()) {
+            Poll::Ready(Some(conn)) => handed.push(*conn.conn_key()),
+            Poll::Ready(None) => panic!("waiter {i} returned None"),
+            Poll::Pending => panic!(
+                "waiter {i} stayed parked although {ENQUEUES} flows were enqueued after it \
+                 parked: {} are still queued behind it",
+                listener.accept_queue.lock().unwrap().len()
+            ),
+        }
+    }
+    while let Some(conn) = listener.try_accept_next() {
+        handed.push(*conn.conn_key());
+    }
+    handed.sort_unstable();
+    assert_eq!(
+        handed,
+        (0..ENQUEUES).collect::<Vec<_>>(),
+        "the parked waiters did not hand back every enqueued flow exactly once"
+    );
+    assert_queue_consistent(&listener);
+}
+
+/// One burst-before-registration round: open `items` flows with no waiter
+/// registered, then drain with `waiters` accept-only tasks and `combined`
+/// combined `poll_next_conn` tasks, each taking one flow and returning to
+/// waiting. Returns how long the drain took and the identity multiset it
+/// handed back.
+async fn burst_round(
+    label: &str,
+    items: u64,
+    waiters: usize,
+    combined: usize,
+    bound: Duration,
+) -> (Duration, Vec<u64>) {
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let transport = GatedTransport::new(addr);
+    let listener = Arc::new(gated_listener(transport.clone()));
+    for key in 0..items {
+        open_flow(&transport, &listener, addr, key).await;
+    }
+    assert_eq!(
+        listener.accept_queue_len.load(Ordering::Acquire),
+        items as usize,
+        "{label}: the burst must be queued whole before the accept side runs"
+    );
+
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..waiters {
+        let listener = Arc::clone(&listener);
+        let accepted = Arc::clone(&accepted);
+        let count = Arc::clone(&count);
+        tasks.spawn(async move {
+            loop {
+                let Some(conn) = listener.accept_next().await else {
+                    return;
+                };
+                accepted.lock().unwrap().push(*conn.conn_key());
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    for _ in 0..combined {
+        let listener = Arc::clone(&listener);
+        let accepted = Arc::clone(&accepted);
+        let count = Arc::clone(&count);
+        tasks.spawn(async move {
+            loop {
+                let conn = listener.poll_next_conn().await.expect("the accept loop");
+                accepted.lock().unwrap().push(*conn.conn_key());
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    let started = Instant::now();
+    let drained = tokio::time::timeout(bound * 4, async {
+        while count.load(Ordering::Relaxed) < items as usize {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        // An aborted (or finished) task is fine; a panic is not.
+        if let Err(err) = result {
+            assert!(err.is_cancelled(), "an acceptor task panicked: {err}");
+        }
+    }
+    let mut handed = accepted.lock().unwrap().clone();
+    handed.sort_unstable();
+    if drained.is_err() {
+        let queued = listener.accept_queue.lock().unwrap().len();
+        panic!(
+            "HANG ({label}): {} of {items} flows were accepted in {:?}, and {queued} are still \
+             queued: a queued flow was never handed to any waiter",
+            handed.len(),
+            elapsed
+        );
+    }
+    if elapsed > bound {
+        // A late drain is its own outcome: a scheduling delay, not a loss, and
+        // it must not be silently scored as either.
+        println!("SOAK_WAKE_LATE {label} elapsed_ms={}", elapsed.as_millis());
+    }
+    assert_queue_consistent(&listener);
+    assert_eq!(
+        listener.accept_queue_len.load(Ordering::Acquire),
+        0,
+        "{label}: the queue must be empty once every dial is handed back"
+    );
+    (elapsed, handed)
+}
+
+/// A burst of N flows enqueued before any waiter exists, then tasks racing to
+/// drain it.
+///
+/// This is the burst-before-registration interleaving: while the burst is
+/// enqueued no waiter is registered, so every flow can only be handed back by
+/// a task that reaches the queue afterwards, and each task takes one flow and
+/// returns to waiting. The verdict is an identity multiset, so a duplicate
+/// handover cannot balance a lost one, and the drain must finish inside a
+/// bound: an overrun is reported as LATE (a scheduling delay, not a loss) and a
+/// drain that never finishes as HANG, with the queue's own length in the panic
+/// so a stranded flow is distinguished from a lost one.
+///
+/// The two rounds differ in who drains: the second keeps only `accept_next`
+/// tasks, so the burst can be handed back only by the queue check at the top
+/// of each wait — the property that makes the surplus flows in
+/// [`m_parked_waiters_and_more_enqueues_than_waiters_lose_no_flow` independent
+/// of the notify's permit accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_enqueued_before_any_waiter_is_handed_back_once_and_in_bound() {
+    let items = wake_env("SOAK_WAKE_ITEMS", 64) as u64;
+    let waiters = wake_env("SOAK_WAKE_WAITERS", 3);
+    let combined = wake_env("SOAK_WAKE_COMBINED", 2);
+    let bound = Duration::from_millis(wake_env("SOAK_WAKE_BOUND_MS", 5_000) as u64);
+    assert!(items > 0 && waiters > 0);
+
+    let cases = [
+        ("accept+combined", waiters, combined),
+        // Only `accept_next` tasks: the burst can then be handed back only by
+        // the queue check at the top of each wait.
+        ("accept-only", waiters, 0),
+    ];
+    for (label, n_waiters, n_combined) in cases {
+        let (_, handed) = burst_round(label, items, n_waiters, n_combined, bound).await;
+        assert_eq!(
+            handed,
+            (0..items).collect::<Vec<_>>(),
+            "{label}: the burst did not come back exactly once per dial"
+        );
+    }
+}
+
+/// An enqueue that finds no registered waiter must leave the wait deliverable
+/// without a further event.
+///
+/// This pins the *permit* half of the wakeup contract, which is the half a
+/// `Notify` wait can silently lose: `notify_one` stores a permit when no waiter
+/// is registered, `notify_waiters` stores none. The accept path needs it
+/// because its wait is entered only after the queue check, so a flow enqueued
+/// in the window between that check and the wait's registration is delivered by
+/// the stored permit alone — a waiter already parked is woken either way, which
+/// is why no other cell in this crate can see the difference.
+///
+/// A wake substituted for `notify_one` must therefore either keep storing a
+/// permit, or register the wait before the queue check (tokio's documented
+/// `enable`-then-`try_recv` order).
+#[tokio::test(flavor = "current_thread")]
+async fn an_enqueue_with_no_registered_waiter_stores_a_permit() {
+    const KEY: u64 = 1;
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let transport = GatedTransport::new(addr);
+    let listener = gated_listener(transport.clone());
+
+    // No waiter exists anywhere while the flow is opened.
+    open_flow(&transport, &listener, addr, KEY).await;
+    assert_eq!(
+        listener.accept_queue_len.load(Ordering::Acquire),
+        1,
+        "the flow must still be queued: the permit is what is under test, not the queue"
+    );
+
+    let mut waiter = Box::pin(listener.accept_notify.notified());
+    assert_eq!(
+        futures::poll!(waiter.as_mut()),
+        Poll::Ready(()),
+        "the enqueue left no permit: a waiter registering after it would need a later \
+         event to be woken, and the accept path sends none"
     );
 }
