@@ -59,24 +59,30 @@ fatal:
 | `a_burst_enqueued_before_any_waiter_is_handed_back_once_and_in_bound` | 770 | accept-handover wake latency for N flows enqueued before any waiter exists, under `SOAK_WAKE_BOUND_MS`; identity multiset is the verdict |
 | `a_teardown_drains_every_parked_waiter_and_releases_the_listener` (`src/teardown_soak.rs`) | 526 | the parked-waiter census reaching zero inside `SOAK_WAKE_BOUND_MS`, with the listener released |
 
-## The opt-in surface the grammar cannot hold
+## The opt-in surface: `SOAK_*`, in `gate-env-tier`
 
 The crate *is* scalable without rebuilding, but by environment variable rather
-than by `#[ignore]`, so the shared checker's manifest cannot see it: it is
-derived from the `#[ignore]` set alone (`check-gate.py:2896`, `:2809`,
-`:2821`).
+than by `#[ignore]`, so the blocks derived from the `#[ignore]` set cannot see
+it: those are the scenario directory's ignored set (`ignored_scenarios`,
+`check-gate.py:3412`, over the scenario targets at `:3544`) resolved through
+`cargo test --list` (`:3379`). `gate-env-tier` is the block for such a
+surface, and `check-gate.py:2769-2875` is what enforces it: detection needs a
+crate script *and* a Rust source to name the variable (`:2796-2799`, closed
+transitively over the crate's own calls at `:3001`), a detected name the
+declaration omits is an error (`:2822-2830`), and a declared name must be read
+by a source (`:2842-2848`) and named by the surface's runner (`:2849-2856`).
 
 * `SOAK_DIALERS`, `SOAK_ITERATIONS`, `SOAK_SEED`, `SOAK_ACCEPTORS`,
   `SOAK_DIAL_TIMEOUT_MS` (`tests/accept_churn_soak.rs:105-109`),
-  `SOAK_CANCEL_US` (`:115`), `SOAK_ACCEPT_PACE_MS` (`:120`);
-  `SOAK_WAKE_ITEMS`, `SOAK_WAKE_WAITERS`, `SOAK_WAKE_COMBINED`,
-  `SOAK_WAKE_BOUND_MS` (`src/accept_queue_soak.rs:771-774`,
-  `src/teardown_soak.rs:530`).
+  `SOAK_CANCEL_US` (`:115`), `SOAK_ACCEPT_PACE_MS` (`:120`) size the six
+  accept-churn modes; `SOAK_WAKE_ITEMS`, `SOAK_WAKE_WAITERS`,
+  `SOAK_WAKE_COMBINED`, `SOAK_WAKE_BOUND_MS` (`src/accept_queue_soak.rs:771-774`,
+  `src/teardown_soak.rs:530`) size the two lib-tier handover cells.
 * The runner of record is `local/soak_accept_churn.py`: it runs each mode as
   its own process group with a per-batch timeout, kills a hung batch by group
   plus a path-matched sweep, and turns the batches into a **detection limit**
   rather than a bare pass — zero failures in N dials excludes a per-dial loss
-  rate above ~3/N at 95 % (`local/soak_accept_churn.py:343`, `:338`).
+  rate above ~3/N at 95 % (`local/soak_accept_churn.py:319`, `:338`).
 
 Measured cost, default driver sizing (32 dialers, 100 iterations, one batch
 per mode, **debug** build as the driver builds it): 16 320 dials in 1.97 s wall
@@ -85,6 +91,18 @@ strays. The quantity the sweep claims is therefore a **per-dial liveness rate**,
 under a load shape (`dialers × iterations`), an accept topology (the six modes
 of `local/soak_accept_churn.py:48`), a cancellation span and a pacing — not a
 latency or a goodput.
+
+The block carries **one row**, because a row's runner must be a file under the
+crate root that names at least one of the row's variables
+(`check-gate.py:2833-2838`, `:2849-2856`) and the four `SOAK_WAKE_*` names have
+no script runner: they are read in-process (`src/accept_queue_soak.rs:465-467`)
+and sized by whoever invokes `cargo test`. They are therefore declared in the
+one row beside the runner that does exist, and that row's `measures` says which
+half each variable sizes. The two halves are not interchangeable: the
+`SOAK_DIALERS…` half is a per-dial **liveness rate** with a rule-of-three
+bound, and `SOAK_WAKE_BOUND_MS` is the **handover wake bound**, whose overrun
+prints `SOAK_WAKE_LATE` and is informational (`src/accept_queue_soak.rs:741`,
+`src/teardown_soak.rs:505`) while a drain that never completes is fatal.
 
 ## The perf declaration is a negative
 
@@ -101,41 +119,40 @@ a placeholder:
   `impairment` dimension of the coverage space is empty here by construction,
   not by omission. The one loopback-shaped dimension that does exist is
   `scale`, and the sweep above buys it with an external driver.
-* The grammar cannot express a zero-row declaration. A `gate-budgets` block
-  without `baseline = <row>` is an error (`check-gate.py:1968`), a baseline
-  that is not a `gate-perf-design` row is an error (`:2732`), and a baseline no
-  row states a relation against is an error (`:2269`) — so the minimum
-  expressible declaration is *two* rows (a reference plus one relation). An
-  empty `gate-perf-design` plus an empty `gate-budgets` cannot be written, and
-  a `gate-coverage-gaps` block is refused without them
-  (`check-gate.py:2670-2675`). The negative is therefore stated in prose, and
-  the two repairs are: **(a)** add an `#[ignore]`d opt-in scenario in `tests/`
-  that runs a sized sweep in-process and asserts it (the driver's shapes are
-  the natural source, and a second shape one dimension away gives the two-row
-  family the grammar wants), or **(b)** extend the shared grammar with a
-  zero-row / gap-only declaration form, which is tooling this crate does not
-  own.
+* An `#[ignore]`d perf row would declare a bound no test here makes, and the
+  grammar has a **zero-row** form for exactly this: an empty
+  `gate-perf-design`, an empty `gate-budgets` (no `baseline`, no tier budget)
+  and a `gate-coverage-gaps` block carrying at least one `<cell> = <reason>`
+  line, with a `baseline` line beside zero rows refused
+  (`check-gate.py:3229-3245`). The three blocks at the end of this file are
+  that record, and the two gaps it states are the two findings above.
 
-### Two tooling gaps, precisely
+### The tooling gaps this file recorded, and their state
 
-1. **The lib target is outside the manifest.** The checked manifest set is the
-   `#[ignore]` set of the `*.rs` files in the scenario directory
-   (`check-gate.py:2896`) resolved through `cargo test --test <target>`
-   (`:2809`, `:2821`); the reserved `lib` target is honoured only when resolving a
-   `gate-perf-design` row (`:2617-2627`). A lib unit test — which is where this
-   crate's wake-bound cells live, in `src/accept_queue_soak.rs` and
-   `src/teardown_soak.rs`, gated `#[cfg(test)]` at `src/lib.rs:21-24` — can
-   therefore appear in no block: in `gate-manifest` it is a STALE entry, and in
-   `gate-default-required` it resolves through `cargo test --test lib`, which
-   is not a target, so the checker exits on a cargo failure. Repair: accept the
-   reserved `lib` target in `gate-manifest` and `gate-default-required`, or
-   enumerate the package's lib target alongside the scenario directory.
-2. **An env-scaled opt-in tier is invisible to every gate.** `SOAK_*` scaling
-   is a real opt-in surface with a real detection limit and a real runner, and
-   no shared block can name it, because every block keys on `#[ignore]`. Repair:
-   a block that names a non-`test` opt-in runner (its command, its
-   cost and its cells), or a convention that an opt-in tier must be `#[ignore]`d
-   so the existing blocks keep working.
+1. **The lib target was outside the manifest — closed.** The manifest set is
+   still the scenario directory's `#[ignore]` set (`check-gate.py:3412`,
+   `:3544`) resolved through `cargo test --list` (`:3379`), but the reserved
+   `lib` target is now derived beside it (`:3560`) and is nameable in
+   `gate-manifest`, `gate-default-required` and `gate-asserting` as a
+   `lib::<module>::<test>` line (`TargetListings`, `:3138-3160`), resolved
+   through `cargo test -p <package> --lib` rather than the non-target
+   `--test lib`. Probed on this crate: adding
+   `lib::accept_queue_soak::a_burst_enqueued_before_any_waiter_is_handed_back_once_and_in_bound`
+   to `gate-default-required` resolves it and then reports `ASSERTING scenario
+   missing from gate-asserting`, which is the lib target's own test list. The
+   two lib-tier wake-bound cells this file claims are therefore nameable; they
+   stay named in prose here rather than added to the required set, because a
+   lib opt-in no block names is an advisory note and never a failure
+   (`:3575-3593`), and no lib test of this crate is `#[ignore]`d.
+2. **An env-scaled opt-in tier was invisible to every gate — closed by
+   `gate-env-tier`**, the block at the end of this file. It names the
+   variables, the runner, the measured quantity and the cells, parses as
+   `<name> = <vars> | <runner> | <measures> | <cells>`
+   (`check-gate.py:2880-2962`), and detects the surface it declares from a
+   script name *and* a Rust read (`:2796-2799`), so it cannot go stale in
+   silence. Its one limit is a variable with **no script runner**, which is why
+   the four `SOAK_WAKE_*` names share the churn row and are separated by that
+   row's `measures` field.
 
 Everything else in the crate is the `--lib` target's correctness work: the 17
 `tests` module cells, the 8 `accept_queue_soak` cells and the 3 `teardown_soak`
@@ -180,6 +197,30 @@ No `perf`-tier scenario exists, so no report-only body can reach an asserting
 helper and this block is empty:
 
 ```gate-perf-guard-helpers
+```
+
+No test here asserts a performance bound, so the perf declaration is the
+zero-row form — no design row to declare, no reference to state it against, and
+the two dimensions that are empty said so as gaps:
+
+```gate-perf-design
+```
+
+```gate-budgets
+```
+
+```gate-coverage-gaps
+perf-bound@crate=udp_listener = no test in this crate asserts a performance bound: the soaks assert liveness (identity sets and counter equalities), and the one wall-clock bound they carry is the 5 s handover bound whose overrun is informational
+impairment@crate=udp_listener = no impairment instrument is reachable: the crate sits below `rtp` in the dependency graph and `Cargo.toml` has no `netem-test` dependency, so the `impairment` dimension is empty by construction
+```
+
+The crate is scaled without rebuilding by `SOAK_*` variables rather than by
+`#[ignore]`, so its opt-in surface is declared as one `gate-env-tier` row — the
+per-dial liveness rate the runner bounds, and the handover wake bound the
+lib-tier variables size:
+
+```gate-env-tier
+soak-accept-churn = SOAK_DIALERS,SOAK_ITERATIONS,SOAK_SEED,SOAK_ACCEPTORS,SOAK_DIAL_TIMEOUT_MS,SOAK_CANCEL_US,SOAK_ACCEPT_PACE_MS,SOAK_WAKE_ITEMS,SOAK_WAKE_WAITERS,SOAK_WAKE_COMBINED,SOAK_WAKE_BOUND_MS | local/soak_accept_churn.py | the per-dial liveness rate over the six accept-churn modes, reported as N dials plus a rule-of-three 95% upper bound 3/N on the per-dial loss rate rather than as a bare pass, and the lib-tier handover wake bound that the four SOAK_WAKE_* variables size, whose overrun prints SOAK_WAKE_LATE and is informational while a drain that never completes is fatal | liveness@shape=dial-churn+topology=churn, liveness@shape=dial-churn+topology=multi-accept, liveness@shape=dial-churn+topology=mixed, liveness@shape=dial-churn+topology=burst, liveness@shape=dial-churn+topology=cancel, liveness@shape=dial-churn+topology=capacity, wake-bound@shape=handover+scale=items-before-waiter, wake-bound@shape=teardown+scale=parked-waiters
 ```
 
 Run it from this crate's root:
