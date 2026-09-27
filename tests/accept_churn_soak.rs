@@ -741,6 +741,18 @@ async fn stop_accept_side(server: &Arc<Server>, tasks: &mut JoinSet<()>) {
     }
 }
 
+/// Stop the dispatch loop and wait for it to return, so every counter its last
+/// `dispatch_next` call touches has been updated before the caller reads one.
+/// Joining is the whole point: a task that has been signalled may still be
+/// inside the call it was making, and that call's accounting is exactly what a
+/// reader must not race.
+async fn stop_dispatch(server: &Arc<Server>, dispatchers: &mut JoinSet<()>) {
+    server.shutdown.send_replace(true);
+    while let Some(result) = dispatchers.join_next().await {
+        result.expect("the dispatch loop panicked");
+    }
+}
+
 /// Every dial has been read and has reached its one dispatch or drop path.
 fn dispatch_settled(server: &Server, sent: usize) -> bool {
     let stats = snapshot(server);
@@ -953,12 +965,12 @@ async fn accept_queue_at_its_bound_accounts_for_every_flow() {
     .await;
 
     // Wait until every dial has been read and has reached its dispatch or drop
-    // path, so the refusal count is final before it is read. A blast larger
-    // than the listener's receive buffer can hold is dropped by the kernel, so
-    // report the counters rather than only the elapse: a short `received`
-    // count is a blast that outgrew the buffer (resize the phase), while a
-    // short `accounted` count against a full `received` is a datagram that
-    // reached the listener and no dispatch or drop path took it.
+    // path. A blast larger than the listener's receive buffer can hold is
+    // dropped by the kernel, so report the counters rather than only the
+    // elapse: a short `received` count is a blast that outgrew the buffer
+    // (resize the phase), while a short `accounted` count against a full
+    // `received` is a datagram that reached the listener and no dispatch or
+    // drop path took it.
     tokio::time::timeout(Duration::from_secs(30), async {
         while !dispatch_settled(&server, sent.len()) {
             tokio::task::yield_now().await;
@@ -980,7 +992,24 @@ async fn accept_queue_at_its_bound_accounts_for_every_flow() {
             stats.packets_received as i64 - accounted as i64,
         )
     });
+
+    // Quiesce the dispatch loop *before* the refusal count is read, because the
+    // settle predicate above does not imply the counter is final. Refusing a
+    // flow takes the accept-queue lock and bumps `accepts_dropped_queue_full`
+    // (`src/lib.rs:407`), and the datagram is already counted by
+    // `packets_dispatched` earlier in the same call (`src/lib.rs:399`); so the
+    // moment `dispatch_settled`'s sum reaches `sent` is one increment *before*
+    // the last refusal is counted. Reading the count in that window makes
+    // `expected_handed_back` larger than the number of handovers that can ever
+    // happen, and the drain wait below then spins out its whole bound on a
+    // queue that is already empty — observed as `refused_at_settle=127` against
+    // `refused_after_quiesce=128` on this phase. Joining the dispatch task
+    // proves its in-flight `dispatch_next` call returned, which is the property
+    // the read needs. (`shutdown` is re-armed below so the accept side started
+    // next is not stopped by the same signal.)
+    stop_dispatch(&server, &mut dispatchers).await;
     let refused_before_accepting = snapshot(&server).accepts_dropped_queue_full;
+    server.shutdown.send_replace(false);
 
     // Now let the accept side drain what was queued.
     let mut tasks = JoinSet::new();
@@ -1000,12 +1029,29 @@ async fn accept_queue_at_its_bound_accounts_for_every_flow() {
         }
     })
     .await
-    .expect("the accept side did not hand back every queued flow");
+    .unwrap_or_else(|_| {
+        // The oracle for a stall here is the phase's own accounting identity,
+        // not the elapse: a flow that was opened and is neither handed back nor
+        // counted refused is a missing refusal, while a flow still sitting in
+        // the queue is reported as `leftover` by `Batch::violations`.
+        let stats = snapshot(&server);
+        let handled = server.handled.load(Ordering::Relaxed) as u64;
+        let refused = stats.accepts_dropped_queue_full;
+        let unexplained = stats.connections_opened as i64 - handled as i64 - refused as i64;
+        panic!(
+            "the accept side did not hand back every queued flow within the bound: {} dial(s) \
+             sent, {} refused before the accept side started, so {expected_handed_back} \
+             handover(s) were expected; observed {handled} handover(s) and {refused} refusal(s) \
+             in total, with {unexplained} flow(s) opened but neither handed back nor counted \
+             refused (connections_opened={}, handled={handled}, refused={refused}). \
+             `unexplained > 0` is a refusal that was never counted; a flow left in the queue \
+             would instead be reported as `leftover` when the phase is collected.",
+            sent.len(),
+            refused_before_accepting,
+            stats.connections_opened,
+        )
+    });
     stop_accept_side(&server, &mut tasks).await;
-    server.shutdown.send_replace(true);
-    while let Some(result) = dispatchers.join_next().await {
-        result.expect("the dispatch loop panicked");
-    }
 
     batch.sent = sent;
     batch.echoed = Vec::new();
