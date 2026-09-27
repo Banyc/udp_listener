@@ -15,20 +15,20 @@ declares, and what it does not cover.
 Measured on the tree this file is committed with, `cargo test --release`:
 
 * `-- --list --ignored` reports **0 ignored tests** in both targets (33 lib
-  tests, 7 integration tests). Nothing in this crate is `#[ignore]`d.
+  tests, 9 integration tests). Nothing in this crate is `#[ignore]`d.
 * There is **no bench target**: no `benches/` directory, no `[[bench]]` in
   `Cargo.toml`, no `criterion` in `Cargo.lock`.
-* The whole default tier costs **0.85 s** wall clock (`lib` 0.06 s,
-  `accept_churn_soak` 0.71 s). The integration total is one cell —
-  `bursts_against_a_slow_acceptor_lose_no_dial` at 0.71 s — and the lib tier is
-  at the process-start floor.
+* The whole default tier costs **0.91 s** wall clock (`lib` 0.06 s,
+  `accept_churn_soak` 0.71 s, `dispatch_delay` 0.06 s). The churn target's cost
+  is one cell — `bursts_against_a_slow_acceptor_lose_no_dial` at 0.71 s — and
+  the lib tier is at the process-start floor.
 
 So `gate-manifest` below is empty because the crate's ignored set is empty, not
 because the manifest is unwritten: the set the checker re-derives from the
 compiled binaries *is* the empty set. The dual mandate's *time* half has
 nothing to shorten here — the always-run tier is under a second — and its
-*coverage* half has no perf arm to declare, for the reason and with the repair
-recorded under "The perf declaration is a negative" below.
+*coverage* half declares the delay measurement under "The dispatch path's
+per-datagram delay" below.
 
 ## The always-run liveness cells
 
@@ -104,28 +104,34 @@ bound, and `SOAK_WAKE_BOUND_MS` is the **handover wake bound**, whose overrun
 prints `SOAK_WAKE_LATE` and is informational (`src/accept_queue_soak.rs:741`,
 `src/teardown_soak.rs:505`) while a drain that never completes is fatal.
 
-## The perf declaration is a negative
+## The dispatch path's per-datagram delay
 
-There is **no `gate-perf-design` row here**, and that is a finding rather than
-a placeholder:
+A deployed client reports a 190 ms **minimum** round trip where the harness's
+clean arm reports tens of milliseconds. `rtp` reaches the network only through
+this crate, so `tests/dispatch_delay.rs` measures the toll this dispatch path
+adds to a datagram that never queues behind another one — the pooled-buffer
+take, the `HashMap`-under-a-mutex lookup, the `mpsc` hop and the task wakeup —
+**differentially** against a bare socket serving the same echo. The client is
+byte-identical between the two arms, so the difference is the dispatch path and
+nothing else.
 
-* No test in this crate asserts a performance bound. The soaks assert
-  *liveness* (identity sets and counter equalities) and the one wall-clock
-  bound they carry is a 5 s handover bound whose overrun is deliberately
-  informational. A `default`-tier row would declare a perf claim the test does
-  not make.
-* No impairment instrument is reachable. `Cargo.toml` has no `netem-test`
-  dependency and the crate sits *below* `rtp` in the dependency graph, so the
-  `impairment` dimension of the coverage space is empty here by construction,
-  not by omission. The one loopback-shaped dimension that does exist is
-  `scale`, and the sweep above buys it with an external driver.
-* An `#[ignore]`d perf row would declare a bound no test here makes, and the
-  grammar has a **zero-row** form for exactly this: an empty
-  `gate-perf-design`, an empty `gate-budgets` (no `baseline`, no tier budget)
-  and a `gate-coverage-gaps` block carrying at least one `<cell> = <reason>`
-  line, with a `baseline` line beside zero rows refused
-  (`check-gate.py:3229-3245`). The three blocks at the end of this file are
-  that record, and the two gaps it states are the two findings above.
+Measured on the tree this file is committed with (`--release`, best of three):
+median 0.039 ms through the dispatch path against 0.036 ms for the bare echo —
+**0.002 ms of added cost, 0.001 % of the field's floor** — p99 0.079 ms, with
+all 400 datagrams echoed and zero dispatcher-channel drops. The bound is a
+tripwire at 2 ms on the median.
+
+The second arm sweeps pipelining depth and reports the achieved rate beside each
+window, which is what separates a per-datagram toll from a queue: the median
+holds at one datagram in flight (0.032 ms at 25 875/s) and grows with the depth
+(0.146 ms at 16, 0.437 ms at 64, at 126 867/s) — the shape of a serialized
+echoer, not of a fixed cost.
+
+The one dimension that stays empty by construction is `impairment`: `Cargo.toml`
+has no `netem-test` dependency and this crate sits *below* `rtp` in the
+dependency graph, so loss, delay, reordering and rate shaping are the composing
+scenarios' to measure, not this crate's. It is recorded as a gap below rather
+than claimed as a row.
 
 ### The tooling gaps this file recorded, and their state
 
@@ -178,6 +184,8 @@ accept_churn_soak::bursts_against_a_slow_acceptor_lose_no_dial
 accept_churn_soak::accept_under_frequent_cancellation_loses_no_dial
 accept_churn_soak::accept_queue_at_its_bound_accounts_for_every_flow
 accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
+dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
+dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 ```
 
 Every one of them asserts, so the asserting set equals the required set (there
@@ -191,6 +199,8 @@ accept_churn_soak::bursts_against_a_slow_acceptor_lose_no_dial
 accept_churn_soak::accept_under_frequent_cancellation_loses_no_dial
 accept_churn_soak::accept_queue_at_its_bound_accounts_for_every_flow
 accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
+dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
+dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting
@@ -199,19 +209,29 @@ helper and this block is empty:
 ```gate-perf-guard-helpers
 ```
 
-No test here asserts a performance bound, so the perf declaration is the
-zero-row form — no design row to declare, no reference to state it against, and
-the two dimensions that are empty said so as gaps:
+The delay measurement against the bare-socket echo is the reference the
+dispatch sweep is read against, and the sweep's cells vary the depth and the
+achieved rate:
 
 ```gate-perf-design
+dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram = default | 0.03 | baseline | dispatch-floor@path=dispatch+shape=ping-pong+reference=bare-socket
+dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue = default | 0.03 | composite(depth,rate) | dispatch-sweep@depth=one-to-sixty-four+rate=achieved
 ```
 
 ```gate-budgets
+default = 1
+full = 60
+perf = 60
+baseline = dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
+drift = 0.5
+drift_floor_s = 2.0
 ```
 
 ```gate-coverage-gaps
-perf-bound@crate=udp_listener = no test in this crate asserts a performance bound: the soaks assert liveness (identity sets and counter equalities), and the one wall-clock bound they carry is the 5 s handover bound whose overrun is informational
 impairment@crate=udp_listener = no impairment instrument is reachable: the crate sits below `rtp` in the dependency graph and `Cargo.toml` has no `netem-test` dependency, so the `impairment` dimension is empty by construction
+dispatch-floor@host=linux = the floor is measured on the host the suite runs on; the deployed target is linux-musl, and no linux measurement of this path exists here
+dispatch-floor@metric=syscall-count = the syscall and copy counts are properties of the composed paths and are measured in `tokio_udp`; this crate's arm differences them by cost rather than counting them
+dispatch-sweep@lane=multiplexed = the sweep drives one flow; several flows sharing the dispatcher is `rtp`'s composition, not a cell this crate can attribute.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by
