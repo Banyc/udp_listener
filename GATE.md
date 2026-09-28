@@ -329,10 +329,11 @@ current 1024 already carries zero dispatcher loss. If a deeper channel is ever
 needed, the lever to fix first is this crate's own per-slot buffer — the pool
 allocates `PACKET_BUFFER_LENGTH` for every datagram whatever its size, so a slot
 costs 64 KiB rather than the 256 B–1200 B it carries — which would make the same
-coverage affordable by two orders of magnitude. That is recorded as a
-recommendation and deliberately not landed: the capacity has no failing cell to
-repair, and changing its *value* belongs behind a measurement of `rtp`'s own
-consumer cadence, which is not reachable from this crate.
+coverage affordable by two orders of magnitude. That was recorded as a
+recommendation rather than a change while the capacity had no failing cell to
+repair and changing its *value* belongs behind a measurement of `rtp`'s own
+consumer cadence; the per-slot buffer itself is now a per-listener knob (landed
+below) and leaves the capacity untouched.
 
 Three mutations were each shown to turn a check red, and each was restored with
 `touch` and its file's `shasum` re-checked before the next. Replacing the
@@ -349,6 +350,72 @@ reddens its zero-drop assertion naming `the 1024-slot channel dropped 48840 of
 `arrive_datagrams_per_s=371816 consumer_datagrams_per_s=676` — the rate-mismatch
 signature, where the drop at capacity 64 (49 818) and at 1024 (48 840) barely
 differ, which is what "no capacity removes it" looks like.
+
+### The per-datagram receive buffer: sized to the configured bound, and the oversize refusal
+
+The capacity arm above left one cost open: a channel slot retains a pooled
+`PACKET_BUFFER_LENGTH` buffer (65 536 B) whatever the datagram's size, so a
+256-byte datagram occupies 64 KiB while it waits and a full 1024-slot flow
+retains 67.3 MB. That buffer is this crate's, so it is sized here rather than in
+`rtp`.
+
+What bounds the wire datagram is `rtp`'s own MSS, not UDP's ceiling: a data
+datagram is at most `Mss::max_datagram_size()` = `MAX_MSS - 1` bytes
+(`rtp/src/mss.rs`), and `MAX_MSS` is `64 * 1024`. A caller that configures a
+large MSS therefore needs a 64 KiB buffer, and the **default stays
+`PACKET_BUFFER_LENGTH`**: shrinking it below a datagram the kernel may deliver
+would convert that datagram into a drop, and the default is the one length that
+refuses none. The deployed product is bounded well below it — the default
+`NO_FEC_MSS` is 1424 (`rtp/src/udp.rs:70`) — so a caller can set the slot to its
+bound. `rtp` itself still calls `new` (the 64 KiB default) and must be re-pinned
+to pass its MSS before the deployed footprint changes; that is a one-line change
+in `rtp`, a different crate and pin, and is not made here.
+
+`UtpListener::new_with_packet_buffer` (and
+`new_identity_dispatch_with_packet_buffer`) take a `PacketBufferLength`; `new`
+and `new_identity_dispatch` keep the 64 KiB default, so existing callers are
+unchanged. The pool allocates each buffer at the configured length — the pool
+moved in-crate because `primitive`'s `ArcObjPool` takes `fn`-pointer
+allocator/reset and so cannot carry a per-listener capacity — and the read's
+overflow guard compares `n` against the configured length, not the default. A
+datagram that fills (and may therefore have been truncated at) the configured
+length is dropped and counted in `packets_dropped_pkt_buf_overflow`: a counted
+refusal, never a silent shortening.
+
+`packet_buffer_length::a_slot_sized_to_the_bound_delivers_within_it_and_refuses_over_it`
+(default tier, asserting) binds a listener with a 2048-byte bound, sends a
+256-byte datagram (delivered whole, in a slot whose `capacity()` is exactly
+2048), then a 4096-byte datagram: the kernel copies at most 2048 bytes and
+discards the rest, the guard counts one `packets_dropped_pkt_buf_overflow`, and
+nothing is delivered — the flow then carries a second 256-byte datagram intact.
+`packet_buffer_length_footprint::a_slot_sized_to_the_bound_retains_the_bound_not_the_default`
+(default tier, asserting) reads the retained bytes per occupied slot with a
+counting allocator, one bound at a time:
+
+```
+PACKET_BUFFER_SLOT bound=2048 bytes_per_slot=2146 per_flow_at_1024_slots=2.1 MiB; default_bytes_per_slot=67620 default_per_flow_at_1024_slots=66.0 MiB
+```
+
+The bound slot retains 2146 B (2048 plus the handle's overhead) against the
+default's 67 620 B — the same range as the sibling arm's 65 585–67 624 B — so a
+1024-slot flow retains 2.1 MiB instead of 66.0 MiB when the bound is configured
+(32x) and the listener's 1024-flow
+ceiling from 64 GiB to ~2 GiB, for a bound that still carries the deployed MSS
+with room for the codec, FEC and nonce overheads. The worst case is unchanged:
+a caller that needs a 64 KiB datagram passes the 64 KiB default and pays what it
+paid before.
+
+Two mutations were each shown to turn a check red, and each was restored with
+`touch` and its `src/lib.rs` shasum re-checked (`d19a5d1f…`). Making the overflow
+guard compare against `PACKET_BUFFER_LENGTH` instead of
+`self.packet_buffer_length.get()` (the realistic "sized the buffer down, left the
+guard" bug; the count of `self.packet_buffer_length.get()` reads 1 → 0 between
+the edit and the verdict) reddens the functional arm naming `an over-bound
+datagram must be counted as a buffer-overflow refusal` with `left: 0, right: 1`
+— the refusal was not counted, and the truncated 2048-byte datagram was
+dispatched. Passing `PACKET_BUFFER_LENGTH` to `PacketPool::new` instead of the
+configured length reddens the footprint arm naming `the 2048-byte slot retained
+67621 bytes per occupied slot, over twice the bound`.
 
 ### The kernel's own refusal count, and what a sample of it costs
 
@@ -491,6 +558,8 @@ dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
 kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
+packet_buffer_length::a_slot_sized_to_the_bound_delivers_within_it_and_refuses_over_it
+packet_buffer_length_footprint::a_slot_sized_to_the_bound_retains_the_bound_not_the_default
 ```
 
 Every one of them asserts, so the asserting set is the required set plus the
@@ -512,6 +581,8 @@ kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
 kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles
 channel_capacity_sweep::the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates
 channel_capacity_sweep::a_live_consumer_capacity_sweep_shows_the_stall_coverage
+packet_buffer_length::a_slot_sized_to_the_bound_delivers_within_it_and_refuses_over_it
+packet_buffer_length_footprint::a_slot_sized_to_the_bound_retains_the_bound_not_the_default
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting

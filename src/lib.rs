@@ -12,7 +12,6 @@ use std::{
 };
 
 use bytes::BytesMut;
-use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
 use tokio::sync::{Notify, watch};
 
 mod conn;
@@ -34,16 +33,134 @@ pub use conn::{Conn, ConnRead, ConnWrite};
 pub use kernel_refusal::{KernelRefused, RefusalSource};
 pub use transmit::UnreliableTransmit;
 
+/// The default capacity of the pooled buffer one received datagram is read
+/// into. It is the UDP protocol's own datagram ceiling, so the default can
+/// receive any datagram a peer may legally send; a caller whose own wire bound
+/// is smaller should use [`PacketBufferLength`] and [`UtpListener::new_with_packet_buffer`]
+/// instead, because a channel slot retains a buffer of this capacity whatever
+/// the datagram's size.
 pub const PACKET_BUFFER_LENGTH: usize = 2_usize.pow(16);
+
+/// The capacity of the pooled buffer ONE received datagram is read into, and
+/// therefore the memory one dispatcher-channel slot retains while a datagram
+/// waits.
+///
+/// A read that fills the buffer is indistinguishable from a truncated larger
+/// datagram, so the largest datagram this length can *deliver* is `get() - 1`
+/// bytes: a read of `get()` bytes is dropped and counted in
+/// [`ListenerStats::packets_dropped_pkt_buf_overflow`] rather than delivered.
+/// Size it from the bound the peer is allowed to send — for `rtp`, its
+/// configured MSS — so a slot costs the bound rather than the
+/// [`PACKET_BUFFER_LENGTH`] default. Passing a length smaller than a datagram
+/// the kernel may deliver converts that datagram into this counted refusal; it
+/// never silently shortens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketBufferLength(NonZeroUsize);
+impl PacketBufferLength {
+    /// `length` bytes is the buffer size, so `length - 1` is the largest
+    /// datagram delivered.
+    pub const fn new(length: NonZeroUsize) -> Self {
+        Self(length)
+    }
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+impl Default for PacketBufferLength {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(PACKET_BUFFER_LENGTH).unwrap())
+    }
+}
+
 /// Capacity of the bounded queue of newly opened sub-connections waiting for
 /// [`UtpListener::accept_next`]. `dispatch_next` must not block (it is the
 /// process-lifetime dispatch loop), so an overflowed accept queue refuses the
 /// new flow and counts it in `accepts_dropped_queue_full` instead.
 const ACCEPT_QUEUE_CAPACITY: usize = 256;
-const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+const PACKET_POOL_SHARDS: usize = 4;
 
-pub type Packet = ObjScoped<BytesMut>;
+/// A pool of receive buffers, each allocated with ONE fixed capacity, and the
+/// scoped [`Packet`] handle that returns a buffer to it on drop.
+///
+/// The pool is in this crate rather than in `primitive`'s `ArcObjPool` because
+/// that pool's allocator and reset are `fn` pointers and so cannot carry the
+/// per-listener [`PacketBufferLength`]; a pool that cannot be told the bound
+/// would have to allocate the 64 KiB default for every datagram.
+#[derive(Debug)]
+struct PacketPool {
+    capacity: usize,
+    shards: [Mutex<Vec<BytesMut>>; PACKET_POOL_SHARDS],
+    next: AtomicUsize,
+}
+impl PacketPool {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            shards: std::array::from_fn(|_| Mutex::new(Vec::new())),
+            next: AtomicUsize::new(0),
+        })
+    }
+    fn take(self: &Arc<Self>) -> Packet {
+        let shard = self.next.fetch_add(1, Ordering::Relaxed) % PACKET_POOL_SHARDS;
+        let buf = self.shards[shard]
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(self.capacity));
+        Packet {
+            pool: Arc::clone(self),
+            shard,
+            buf: Some(buf),
+        }
+    }
+    fn recycle(&self, shard: usize, mut buf: BytesMut) {
+        // Reclaim the read offset `advance` left behind (and, if a dispatch
+        // closure `split_to`'d the buffer, either reclaim it or let the
+        // over-capacity handle go). `chunk_mut` returns `capacity - len`, so a
+        // buffer returned with a smaller capacity would make the next read
+        // truncate at a length other than the configured bound.
+        buf.clear();
+        if buf.capacity() != self.capacity {
+            buf.reserve(self.capacity);
+        }
+        if buf.capacity() != self.capacity {
+            return;
+        }
+        // Return it to the shard it came from: a round-robin that chose a
+        // different shard on the way back would cycle buffers between shards
+        // and allocate a fresh one instead of reusing the returned one.
+        self.shards[shard].lock().unwrap().push(buf);
+    }
+}
 
+/// One received datagram's buffer, returned to its listener's pool on drop.
+///
+/// Derefs to its [`BytesMut`], so a dispatch closure reads, advances and
+/// truncates it exactly as the pooled handle it replaces.
+#[derive(Debug)]
+pub struct Packet {
+    pool: Arc<PacketPool>,
+    shard: usize,
+    buf: Option<BytesMut>,
+}
+impl core::ops::Deref for Packet {
+    type Target = BytesMut;
+    fn deref(&self) -> &BytesMut {
+        self.buf.as_ref().expect("the buffer is present until drop")
+    }
+}
+impl core::ops::DerefMut for Packet {
+    fn deref_mut(&mut self) -> &mut BytesMut {
+        self.buf.as_mut().expect("the buffer is present until drop")
+    }
+}
+impl Drop for Packet {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.recycle(self.shard, buf);
+        }
+    }
+}
 /// Outcome of a single [`UtpListener::dispatch_next`] datagram read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
@@ -202,8 +319,9 @@ where
     is_utp_connected: bool,
     utp: Arc<Utp>,
     conn_table: ConnTable<K, V>,
-    pkt_buf_pool: ArcObjPool<BytesMut>,
+    pkt_buf_pool: Arc<PacketPool>,
     dispatcher_buffer_size: NonZeroUsize,
+    packet_buffer_length: PacketBufferLength,
     dispatch: Classify<SocketAddr, K, V>,
     stats: ListenerStats,
     crypto_warn_limiter: RateLimiter,
@@ -278,6 +396,7 @@ where
             .field("utp", &self.utp)
             .field("conn_table", &self.conn_table)
             .field("dispatcher_buffer_size", &self.dispatcher_buffer_size)
+            .field("packet_buffer_length", &self.packet_buffer_length)
             .finish()
     }
 }
@@ -287,6 +406,20 @@ where
 {
     /// Construct a TCP-like listener using peer addresses as dispatch keys.
     pub fn new_identity_dispatch(socket: Utp, dispatcher_buffer_size: NonZeroUsize) -> Self {
+        Self::new_identity_dispatch_with_packet_buffer(
+            socket,
+            dispatcher_buffer_size,
+            PacketBufferLength::default(),
+        )
+    }
+
+    /// [`Self::new_identity_dispatch`] with the receive buffer and channel
+    /// slot sized to the caller's own bound (see [`PacketBufferLength`]).
+    pub fn new_identity_dispatch_with_packet_buffer(
+        socket: Utp,
+        dispatcher_buffer_size: NonZeroUsize,
+        packet_buffer_length: PacketBufferLength,
+    ) -> Self {
         let dispatch = |addr: &SocketAddr, packet: Packet| {
             Some(Classified {
                 key: *addr,
@@ -294,7 +427,12 @@ where
                 policy: DispatchPolicy::Create,
             })
         };
-        UtpListener::new(socket, dispatcher_buffer_size, Arc::new(dispatch))
+        UtpListener::new_with_packet_buffer(
+            socket,
+            dispatcher_buffer_size,
+            packet_buffer_length,
+            Arc::new(dispatch),
+        )
     }
 }
 impl<Utp, K, V> UtpListener<Utp, K, V>
@@ -306,15 +444,28 @@ where
         dispatcher_buffer_size: NonZeroUsize,
         dispatch: Classify<SocketAddr, K, V>,
     ) -> Self {
-        let pkt_buf_pool = ArcObjPool::new(
-            None,
-            OBJ_POOL_SHARDS,
-            || BytesMut::with_capacity(PACKET_BUFFER_LENGTH),
-            |buf| {
-                buf.clear();
-                buf.reserve(PACKET_BUFFER_LENGTH);
-            },
-        );
+        Self::new_with_packet_buffer(
+            utp,
+            dispatcher_buffer_size,
+            PacketBufferLength::default(),
+            dispatch,
+        )
+    }
+
+    /// Construct a listener whose per-datagram receive buffer — and therefore
+    /// the memory each dispatcher-channel slot retains — is sized to the
+    /// caller's own wire bound rather than the [`PACKET_BUFFER_LENGTH`] default.
+    ///
+    /// See [`PacketBufferLength`] for the oversize policy: a datagram that
+    /// fills (and may therefore have been truncated at) the configured length
+    /// is dropped and counted, never silently shortened.
+    pub fn new_with_packet_buffer(
+        utp: Utp,
+        dispatcher_buffer_size: NonZeroUsize,
+        packet_buffer_length: PacketBufferLength,
+        dispatch: Classify<SocketAddr, K, V>,
+    ) -> Self {
+        let pkt_buf_pool = PacketPool::new(packet_buffer_length.get());
         let (idle, _) = watch::channel(true);
         Self {
             is_utp_connected: utp.peer_addr().is_ok(),
@@ -322,6 +473,7 @@ where
             conn_table: Arc::new(Mutex::new(HashMap::new())),
             pkt_buf_pool,
             dispatcher_buffer_size,
+            packet_buffer_length,
             dispatch,
             stats: ListenerStats::new(),
             crypto_warn_limiter: RateLimiter::new(Duration::from_secs(1)),
@@ -405,7 +557,7 @@ where
     ///
     /// This method is cancel safe.
     pub async fn dispatch_next(&self) -> std::io::Result<Dispatch> {
-        let mut pkt_buf = self.pkt_buf_pool.take_scoped();
+        let mut pkt_buf = self.pkt_buf_pool.take();
         let (n, addr) = if self.is_utp_connected {
             let n = self.utp.recv_buf(&mut *pkt_buf).await?;
             let addr = self.utp.peer_addr()?;
@@ -414,7 +566,7 @@ where
             self.utp.recv_buf_from(&mut *pkt_buf).await?
         };
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-        if n == PACKET_BUFFER_LENGTH {
+        if n == self.packet_buffer_length.get() {
             self.stats
                 .packets_dropped_pkt_buf_overflow
                 .fetch_add(1, Ordering::Relaxed);
