@@ -14,9 +14,10 @@ declares, and what it does not cover.
 
 Measured on the tree this file is committed with, `cargo test --release`:
 
-* `-- --list --ignored` reports **1 ignored test**: the receive-buffer drop-site
-  sweep below (`recv_buffer_drop_sites`). Every other test in the crate is
-  required-default.
+* `-- --list --ignored` reports **4 ignored tests**: the receive-buffer
+  drop-site sweep (`recv_buffer_drop_sites`), the kernel's per-socket refusal
+  arm (`kernel_refusal`), and the two channel-capacity arms
+  (`channel_capacity_sweep`). Every other test in the crate is required-default.
 * There is **no bench target**: no `benches/` directory, no `[[bench]]` in
   `Cargo.toml`, no `criterion` in `Cargo.lock`.
 * The whole default tier costs **0.89 s** wall clock (`lib` 0.07 s,
@@ -27,12 +28,13 @@ Measured on the tree this file is committed with, `cargo test --release`:
   median is 2.6 ms over ten process runs). The new sweep is `#[ignore]`d and so
   is not part of this cost.
 
-So `gate-manifest` below carries one line, the opt-in sweep; the checker
+So `gate-manifest` below carries four lines, the opt-in scenarios; the checker
 re-derives that set from the compiled binaries, so a test silently re-ignored is
 an error. The dual mandate's *time* half still has nothing to shorten in the
 always-run tier — it is under a second — and its *coverage* half declares the
-delay measurement under "The dispatch path's per-datagram delay" and the
-buffer split under "The two receive-side buffers" below.
+delay measurement under "The dispatch path's per-datagram delay", the buffer
+split under "The two receive-side buffers", and the channel's capacity under
+"The per-flow channel" below.
 
 ## The always-run liveness cells
 
@@ -243,6 +245,111 @@ did not produce strictly increasing effective buffer sizes: [("floor-4KiB",
 786896), …]` — every row at the host default, which is the fixture measuring
 nothing. Both were restored with `touch` and the pristine run is green.
 
+## The per-flow channel: the knee, the burst bound, and what a slot costs
+
+The sibling arm above sizes the *kernel* receive buffer and reads the dispatcher
+drop beside it; the residual it cannot remove is the channel's. This arm sweeps
+the channel instead. The knob is the `dispatcher_buffer_size` argument to
+`UtpListener::new`, which sizes the per-flow `tokio::sync::mpsc::channel` this
+crate builds at `src/lib.rs:479` on the dispatch path and `:589` in
+`register_conn`. The channel is this crate's and the tests reach its capacity
+through the constructor's own seam; the *value* is `rtp`'s, which passes
+`DISPATCHER_BUF_SIZE + data_settings.max()` (`rtp/src/udp.rs:274`) and bare
+`DISPATCHER_BUF_SIZE` — 1024, `rtp/src/udp.rs:71` — at `keyed_udp.rs:107,215`
+and `mpudp.rs:30`. No `rtp` change is needed to sweep it and none was made.
+
+`channel_capacity_sweep::the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates`
+(opt-in, `standard` tier, asserting, measured 0.5 s) offers `BURST = 4096`
+256-byte datagrams at six capacities with the **dispatch loop live** and a
+**stalled consumer**, so the kernel queue never accumulates and the channel is
+the only buffer measured. One run, load 2.8 on ten cores, release:
+
+```
+CHANNEL_CAPACITY_SWEEP capacity=64     offered=4097 received=4097 accepted=64     dispatcher_dropped=4033 kernel_dropped=0 delivered=64     bytes=4327968   bytes_per_slot=67624 drain_datagrams_per_s=4876190
+CHANNEL_CAPACITY_SWEEP capacity=256    offered=4097 received=4097 accepted=256    dispatcher_dropped=3841 kernel_dropped=0 delivered=256    bytes=16923536  bytes_per_slot=66108 drain_datagrams_per_s=7897091
+CHANNEL_CAPACITY_SWEEP capacity=1024   offered=4097 received=4097 accepted=1024   dispatcher_dropped=3073 kernel_dropped=0 delivered=1024   bytes=67304992  bytes_per_slot=65728 drain_datagrams_per_s=13370939
+CHANNEL_CAPACITY_SWEEP capacity=2048   offered=4097 received=4097 accepted=2048   dispatcher_dropped=2049 kernel_dropped=0 delivered=2048   bytes=134480352 bytes_per_slot=65664 drain_datagrams_per_s=20168994
+CHANNEL_CAPACITY_SWEEP capacity=4096   offered=4097 received=4097 accepted=4096   dispatcher_dropped=1    kernel_dropped=0 delivered=4096   bytes=268699744 bytes_per_slot=65601 drain_datagrams_per_s=30406509
+CHANNEL_CAPACITY_SWEEP capacity=8192   offered=4097 received=4097 accepted=4097   dispatcher_dropped=0    kernel_dropped=0 delivered=4097   bytes=268701696 bytes_per_slot=65585 drain_datagrams_per_s=35768851
+CHANNEL_CAPACITY_SWEEP_KNEE first_capacity_with_zero_drops=8192 received=4097 delivered=4097 kernel_dropped=0 bytes_per_slot=65585
+```
+
+The loss is a **burst bound** and the knee is exact: `dispatcher_dropped =
+received - capacity` on every row, and the drop reaches zero at the first
+capacity that holds the burst (4097 datagrams here, so the sweep's next grid
+point, 8192, is the first row that reads zero while a row at 4096 still drops
+the one opener that overflows it). **The channel only has to be as deep as the
+burst a stalled consumer accumulates**: above that every extra slot is idle,
+below it every extra slot is a datagram delivered. A *rate* mismatch would show
+a drop that does not fall with capacity; the live arm and the vacuity probe
+below are that branch.
+
+What a slot costs is the second reading, and it is not the datagram. A channel
+entry is an `ObjScoped<BytesMut>` whose buffer was allocated with
+`PACKET_BUFFER_LENGTH` (65 536 B) and is *not* shrunk after `recv_buf_from`
+writes the datagram into it, so `bytes_per_slot` measures 65 585–67 624 B: a
+256-byte datagram occupies 64 KiB of resident memory while it waits. At `rtp`'s
+own 1024 slots that is **67.3 MB for one full flow**; at the listener's
+`max_connections` ceiling of 1024 flows (`rtp/src/udp.rs:81`) that is a **64 GiB**
+ceiling if every flow fills. The operator's client reaches this through **one
+long-lived mux session**, so the flow count today is one and the cost is 67.3 MB;
+but it is capacity-linear at 64 KiB per slot whenever the channel grows.
+
+`channel_capacity_sweep::a_live_consumer_capacity_sweep_shows_the_stall_coverage`
+(opt-in, `standard` tier, asserting, measured 0.4 s) fixes the offer at 50 000
+datagrams and varies only the capacity while a consumer drains the flow's read
+half in a tight loop — the fastest a consumer can take datagrams out of this
+channel, and so an upper bound on `rtp`'s own rate. One run, same host:
+
+```
+CHANNEL_CAPACITY_LIVE capacity=1      offered=50001 received=50001 accepted=15306 dispatcher_dropped=34695 delivered=15306 arrive_datagrams_per_s=600251 consumer_datagrams_per_s=113521
+CHANNEL_CAPACITY_LIVE capacity=64     offered=50001 received=50001 accepted=49412 dispatcher_dropped=589   delivered=49412 arrive_datagrams_per_s=586588 consumer_datagrams_per_s=360928
+CHANNEL_CAPACITY_LIVE capacity=1024   offered=50001 received=50001 accepted=50001 dispatcher_dropped=0     delivered=50001 arrive_datagrams_per_s=590647 consumer_datagrams_per_s=367949
+CHANNEL_CAPACITY_LIVE_SWEEP smallest_overloading_capacity=1 drops_at_smallest=34695 product_capacity=1024 product_dropped=0 product_consumer_datagrams_per_s=367949 product_arrive_datagrams_per_s=590647
+```
+
+A live consumer is not a reprieve: a one-slot channel still loses 69 % of a
+saturating offer, because the consumer's scheduling latency exceeds the one-slot
+horizon. Capacity buys **stall coverage** of `capacity / arrival_rate` seconds,
+so the knee for a live flow is the same formula as for a burst — `capacity >
+arrival_rate × consumer_stall`. At this rig's ~590 000 datagrams/s, 64 slots
+cover 108 µs (589 datagrams lost to micro-stalls) and 1024 slots cover 1.7 ms
+with zero loss. `rtp`'s own 1024 already covers the local micro-stalls measured
+here, and a *wire* RTT spike (the field's 190 ms–3.2 s) does not stall the local
+drain at all — it delays ACKs, not the consumer.
+
+**What the product should do.** Neither arm shows a rate mismatch, so no capacity
+is *unboundedly* required: the product should size the channel by the **local
+consumer stall**, not by the wire RTT, and the value it has (1024, chosen by
+`rtp`) measures loss-free under a live consumer at this host's arrival rate. The
+recommendation is therefore **not** to raise `DISPATCHER_BUF_SIZE`: at 64 KiB per
+slot, covering a one-second consumer stall at 10 000 datagrams/s would cost
+640 MB per flow and a field-spike-sized 3.2 s would cost 2 GiB, while the
+current 1024 already carries zero dispatcher loss. If a deeper channel is ever
+needed, the lever to fix first is this crate's own per-slot buffer — the pool
+allocates `PACKET_BUFFER_LENGTH` for every datagram whatever its size, so a slot
+costs 64 KiB rather than the 256 B–1200 B it carries — which would make the same
+coverage affordable by two orders of magnitude. That is recorded as a
+recommendation and deliberately not landed: the capacity has no failing cell to
+repair, and changing its *value* belongs behind a measurement of `rtp`'s own
+consumer cadence, which is not reachable from this crate.
+
+Three mutations were each shown to turn a check red, and each was restored with
+`touch` and its file's `shasum` re-checked before the next. Replacing the
+channel's capacity argument with `1` at `src/lib.rs:479` (one of two
+`self.dispatcher_buffer_size.get()` occurrences, so the count 2 → 1 was printed
+between the edit and the verdict) reddens the sweep naming `capacity 64: the
+channel accepted 1 of 4097 received datagrams, not min(received, 64)`. Allocating
+the pooled buffer at 1024 B instead of `PACKET_BUFFER_LENGTH` (the pool's one
+such occurrence) reddens the cost reading naming `capacity 64: 64 delivered
+datagrams retained only 328464 bytes, under one PACKET_BUFFER_LENGTH (65536)
+each`. Sleeping 200 µs per drained datagram in the live arm's own consumer
+reddens its zero-drop assertion naming `the 1024-slot channel dropped 48840 of
+50001 datagrams with a live consumer draining` while printing
+`arrive_datagrams_per_s=371816 consumer_datagrams_per_s=676` — the rate-mismatch
+signature, where the drop at capacity 64 (49 818) and at 1024 (48 840) barely
+differ, which is what "no capacity removes it" looks like.
+
 ### The kernel's own refusal count, and what a sample of it costs
 
 This arm separates the two drop sites only because the arm *is* the sender and
@@ -365,6 +472,8 @@ The `#[ignore]`d scenarios, and the tier each belongs to:
 ```gate-manifest
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard
 kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles = standard
+channel_capacity_sweep::the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates = standard
+channel_capacity_sweep::a_live_consumer_capacity_sweep_shows_the_stall_coverage = standard
 ```
 
 The always-run cells the gate exists for are pinned as required-default, so a
@@ -385,7 +494,7 @@ kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
 ```
 
 Every one of them asserts, so the asserting set is the required set plus the
-one opt-in scenario:
+four opt-in scenarios:
 
 ```gate-asserting
 accept_churn_soak::churn_over_the_combined_accept_path_loses_no_dial
@@ -401,6 +510,8 @@ dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_droppe
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel
 kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
 kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles
+channel_capacity_sweep::the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates
+channel_capacity_sweep::a_live_consumer_capacity_sweep_shows_the_stall_coverage
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting
@@ -419,6 +530,8 @@ dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue = default 
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped = default | 0.01 | composite(buffer,reference,shape) | dispatcher-overflow@path=dispatch+shape=burst+reference=parked-reader+buffer=four-slots
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard | 1.9 | composite(size,name,load,split) | recv-buffer-drops@size=256-and-1200+name=so_rcvbuf+load=stalled-burst+split=kernel-vs-dispatcher
 kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles = standard | 0.5 | composite(source,buffer,split) | kernel-refusal@source=proc-net-udp+buffer=floor-4KiB-and-host-default+split=kernel-vs-dispatcher
+channel_capacity_sweep::the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates = standard | 0.5 | composite(capacity,payload,load) | channel-capacity@capacity=64-to-8192+payload=256+load=stalled-burst
+channel_capacity_sweep::a_live_consumer_capacity_sweep_shows_the_stall_coverage = standard | 0.4 | composite(capacity,rate) | channel-capacity-live@capacity=1-and-64-and-1024+rate=achieved
 ```
 
 ```gate-budgets
@@ -445,6 +558,9 @@ kernel-refusal@host=linux-musl = the per-socket reading was type-checked for `x8
 kernel-refusal@host=macos = this host has no per-socket counter; the arm measures the host-wide `dropped due to full socket buffers` total instead, which every UDP socket on the machine contributes to, so on macOS the reconciliation it runs is that host-wide delta and not a reading the product reports.
 kernel-refusal@source=so-rxq-ovfl = the `SO_RXQ_OVFL` control message carries the same `sk_drops` count and is not implemented: it costs a control-message parse per received datagram and an enable step the transport's `recv_buf` path has no place for, where the polled `/proc` read costs one file read per sample. The choice is source-level, not measured: the cmsg path's per-datagram cost was not measured because it was not built.
 kernel-refusal@scale=socket-count = a sample costs one `open`+`read`+`close` of `/proc/net/udp` and the decode, both linear in the host's UDP socket count (measured: 167-213 µs at 32 rows, 7.8-7.9 ms at 2 032 rows on a 1-vCPU host). A host with thousands of UDP sockets therefore pays milliseconds per sample, and no cheaper source of the same per-socket count exists in this crate.
+channel-capacity@transport=rtp = the sweep sizes the channel through `udp_listener`'s own constructor seam and reads its own counters; `rtp`'s composing consumer — its poll cadence over `UnreliableRead::try_recv` — is not reachable from this crate, so the drain rate measured here is a tight-`try_recv` upper bound and not the product's own rate. Sizing the channel for the field therefore needs `rtp`'s consumer cadence, which is not a cell this crate can fill; the value `rtp` passes (1024) is left untouched.
+channel-capacity@host=linux-musl = the knee, the arrival rate and the drain rate are this host's (macOS). `PACKET_BUFFER_LENGTH` is platform-independent, so the 64 KiB per slot carries to the deployed target, but the rates do not.
+channel-capacity@shape=dispatch-stall = both arms run the dispatch loop live from the first datagram, so `received` is the wire's delivery and the channel is the only buffer measured; the unpolled-dispatch shape, where the kernel queue itself fills, is the sibling arm's and `tokio_udp`'s, not a cell here.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by
