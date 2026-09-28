@@ -243,6 +243,88 @@ did not produce strictly increasing effective buffer sizes: [("floor-4KiB",
 786896), …]` — every row at the host default, which is the fixture measuring
 nothing. Both were restored with `touch` and the pristine run is green.
 
+### The kernel's own refusal count, and what a sample of it costs
+
+This arm separates the two drop sites only because the arm *is* the sender and
+so knows `offered`. In production the listener knows neither `offered` nor the
+kernel's refusal count, so a kernel refusal and a datagram the path never
+delivered were one number — which is the operator's field problem, where an ISP
+penalises a saturated UDP destination for loss that is not the path's. That gap
+is closed on Linux by `UtpListener::kernel_refused`, which reads the socket's own
+`sk_drops` from the `drops` column of `/proc/net/udp` and `/proc/net/udp6`
+(`udp4_format_sock`, `net/ipv4/udp.c:3246`) — the same counter the `SO_RXQ_OVFL`
+control message carries. The socket is named by its descriptor
+(`UnreliableTransmit::raw_fd`, resolved through `/proc/self/fd` and matched on
+the table's `inode` column), which is exact where a local-address match is
+ambiguous under `SO_REUSEPORT`.
+
+`kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles`
+(opt-in, `standard` tier, asserting, measured 0.5 s) offers the sibling arm's
+stalled burst on two receive buffers and reads both self-inflicted sites plus the
+kernel's own count. On a remote x86_64 Linux 6.8 host, release musl, load 0.13:
+
+```
+KERNEL_REFUSAL platform=linux label=floor-4KiB effective=8192 offered=32769 received=11 dispatched=11 self_refused=0 delivered=11 kernel_refused=32758 sender_derived=32758 source=ProcNetUdp4
+KERNEL_REFUSAL platform=linux label=host-default effective=212992 offered=32769 received=239 dispatched=239 self_refused=0 delivered=239 kernel_refused=32530 sender_derived=32530 source=ProcNetUdp4
+KERNEL_REFUSAL platform=linux fresh_socket per_socket refused=0 source=ProcNetUdp4
+```
+
+`kernel_refused` equals the sender's own `offered - received` exactly, row for
+row, and a fresh socket reads zero — so the number is this socket's, counted by
+the kernel, and not a quantity the sender recomputed. That host's
+`net.core.rmem_max` is 212 992 B, so its receive buffer holds fewer datagrams
+than the 1 024-slot channel and `self_refused` stays 0; the two sites carrying a
+non-zero count *at once* is shown on macOS instead, where the arm still reads the
+dispatcher drop (1 709) beside the kernel refusal (30 036).
+
+macOS keeps no per-socket counter, so the reading there is
+`KernelRefused::NotPerSocket` with the reason, and the arm measures what macOS
+does keep — one host-wide `dropped due to full socket buffers` total — against a
+quiet baseline. Release, load 5.2–9.2 on ten cores:
+
+```
+KERNEL_REFUSAL platform=macos quiet_window_ms=200 host_wide_drift=0
+KERNEL_REFUSAL platform=macos label=floor-4KiB effective=4096 offered=32769 received=15 dispatched=15 self_refused=0 delivered=15 sender_derived_kernel_dropped=32754 host_wide_delta=32754
+KERNEL_REFUSAL platform=macos label=host-default effective=786896 offered=32769 received=2733 dispatched=1024 self_refused=1709 delivered=1024 sender_derived_kernel_dropped=30036 host_wide_delta=30036
+```
+
+The host-wide delta equals the per-socket refusals exactly on this quiet host,
+and a zero-drift baseline shows it was the burst that moved it. It is an upper
+bound in general — every UDP socket on the machine contributes — which is why it
+is an instrument inside the arm and not a value the product reports.
+
+Four mutations were each shown to turn a check red, and each was restored with
+`touch` before the next: reading the `ref` column as the inode in `parse_row`
+(one of two `tail.next()?;` lines removed) reddens three of the four decoder unit
+tests, naming `Absent` where `Found(4)` was expected and `Some(Row { inode: 2,
+drops: 4 })` where the header must be `None`; a macOS reader returning
+`PerSocket { refused: 0, .. }` reddens the platform arm naming `no per-socket
+refusal count exists on macos, yet one was reported: 0 from ProcNetUdp4`;
+taking the table's first row instead of matching the inode reddens the Linux arm
+naming `Unidentified { reason: "two rows … different refusal counts" }`; a
+host-wide counter pinned to a constant reddens the macOS arm naming `the
+host-wide counter moved by 0 over a burst the sender says was refused 32754
+times`.
+
+**Cost.** The reading is polled and nothing on the receive path calls it, so the
+per-datagram cost is zero by construction — `kernel_refused` is referenced only
+by its own definition, its module and the tests. A sample costs one
+`open`+`read`+`close` of the kernel's socket table plus the decode, and both are
+linear in the number of UDP sockets the host has. Measured on the same 1-vCPU
+Linux host, release musl, padding the table by opening extra UDP sockets:
+
+```
+/proc/net/udp rows           32      2032
+kernel_refused per call     167-213 us   7.81-7.94 ms
+```
+
+The decode alone over a 33-row table is 63.8 µs on that host and 7.0 µs on a
+faster one, so roughly half a sample is the decode and half the kernel's own
+`/proc` walk and `seq_printf`. Nothing is retained: a `String` for the table, one
+for the fd path, and a scratch slice per row. A socket-heavy host therefore pays
+milliseconds per sample, which is why the reading is a poll and why that is
+recorded as a gap below rather than left implied by the word "polled".
+
 ### The tooling gaps this file recorded, and their state
 
 1. **The lib target was outside the manifest — closed.** The manifest set is
@@ -359,9 +441,10 @@ recv-buffer-drops@host=linux = the buffer depths are this host's (macOS); the de
 recv-buffer-drops@transport=rtp = `rtp` was off limits; the channel is sized to rtp's `DISPATCHER_BUF_SIZE` but the composing transport's own drain, repair ladder and congestion response are not exercised, and the per-flow drop's repair cost is not measured here.
 recv-buffer-drops@shape=live-dispatch-loop = the burst is offered while the dispatch task is not polled; with the loop live the kernel queue never accumulates, so this arm says nothing about a live-reader regime — `tokio_udp`'s `rcvbuf_cliff` measures that shape.
 recv-buffer-drops@metric=kernel-refusal-counter = **closed for Linux, and only there.** The kernel's refused-datagram count is no longer derived by the sender: `UtpListener::kernel_refused` reads it from `/proc/net/udp{,6}`'s `drops` column (`sk_drops`), so `peer_offered = packets_received + kernel_refused` is computable and the residual is the path loss. The platform and mechanism limits that remain are the three gaps below.
-kernel-refusal@host=linux-musl = the per-socket reading was type-checked for `x86_64-unknown-linux-musl` on this host and run end-to-end on a remote x86_64 Linux host, not on the deployed hosts' kernels and not in the deployed musl build; the `/proc` column it reads is 13 whitespace-separated fields there and the Linux default `rmem_max` is far below the channel, so the above-knee regime of the sibling arm was not reachable on that host.
+kernel-refusal@host=linux-musl = the per-socket reading was type-checked for `x86_64-unknown-linux-musl` on this host and run end-to-end as a static release musl build on a remote x86_64 Linux 6.8 host, where `kernel_refused` equalled the sender's own `offered - received` exactly; it was not run on the deployed hosts' kernels. That host's `net.core.rmem_max` is 212 992 B, so its receive buffer holds fewer datagrams than the 1 024-slot channel and the above-knee regime of the sibling arm is not reachable there.
 kernel-refusal@host=macos = this host has no per-socket counter; the arm measures the host-wide `dropped due to full socket buffers` total instead, which every UDP socket on the machine contributes to, so on macOS the reconciliation it runs is that host-wide delta and not a reading the product reports.
-kernel-refusal@source=so-rxq-ovfl = the `SO_RXQ_OVFL` control message carries the same `sk_drops` count and is not implemented: it costs a control-message parse per received datagram and an enable step the transport's `recv_buf` path has no place for, where the polled `/proc` read costs one file read per sample. Neither mechanism is measured for cost on this host (no `/proc` here), so this is a source-level choice, not a measured one.
+kernel-refusal@source=so-rxq-ovfl = the `SO_RXQ_OVFL` control message carries the same `sk_drops` count and is not implemented: it costs a control-message parse per received datagram and an enable step the transport's `recv_buf` path has no place for, where the polled `/proc` read costs one file read per sample. The choice is source-level, not measured: the cmsg path's per-datagram cost was not measured because it was not built.
+kernel-refusal@scale=socket-count = a sample costs one `open`+`read`+`close` of `/proc/net/udp` and the decode, both linear in the host's UDP socket count (measured: 167-213 µs at 32 rows, 7.8-7.9 ms at 2 032 rows on a 1-vCPU host). A host with thousands of UDP sockets therefore pays milliseconds per sample, and no cheaper source of the same per-socket count exists in this crate.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by

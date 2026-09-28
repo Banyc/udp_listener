@@ -292,4 +292,45 @@ mod tests {
         assert_eq!(parse_socket_inode("socket:[]"), None);
         assert_eq!(parse_socket_inode("/tmp/a.sock"), None);
     }
+
+    /// What the decoder alone costs over a table the size of a real host's, so
+    /// that the price of a polled reading can be attributed between this and
+    /// the kernel's own `open`+`read`+`close` of `/proc`. The kernel side is not
+    /// measurable from here; the assertion is that every sample found the row,
+    /// so a lookup that had started failing cannot report a cheap zero.
+    #[test]
+    fn the_decoder_cost_over_a_realistic_table_is_measured() {
+        const ROWS: usize = 33;
+        const INODE: u64 = 9_825_184;
+        let mut table = String::from(
+            "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
+             timeout inode ref pointer drops\n",
+        );
+        for row in 0..ROWS - 1 {
+            table.push_str(&format!(
+                "{row:5}: 00000000:{:04X} 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 {row:7} 2 ffff8c21484e2d00 0\n",
+                0xFB48 + row
+            ));
+        }
+        table.push_str(REAL_V4_ROW);
+        assert_eq!(
+            table.lines().count(),
+            ROWS + 1,
+            "the fixture is not the table it claims"
+        );
+
+        const SAMPLES: u32 = 1_000;
+        let start = std::time::Instant::now();
+        for _ in 0..SAMPLES {
+            assert_eq!(
+                lookup(std::hint::black_box(&table), INODE),
+                Lookup::Found(4)
+            );
+        }
+        let per_lookup_us = start.elapsed().as_nanos() as f64 / f64::from(SAMPLES) / 1_000.0;
+        println!(
+            "KERNEL_REFUSAL decoder_us_per_lookup={per_lookup_us:.3} table_rows={ROWS} \
+             samples={SAMPLES}"
+        );
+    }
 }

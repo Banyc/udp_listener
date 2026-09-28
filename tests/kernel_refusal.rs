@@ -107,6 +107,9 @@ struct Row {
     dispatched: u64,
     self_refused: u64,
     delivered: u64,
+    /// The measured cost of one polled reading, on the platform that has one.
+    #[cfg(target_os = "linux")]
+    poll_cost_us: f64,
 }
 
 /// Drain the socket into the dispatcher until the counters stop moving, and
@@ -184,6 +187,32 @@ async fn one_row(request: Option<usize>, label: &'static str) -> Row {
     drainer.abort_all();
 
     let after = listener.kernel_refused();
+    // The reading is polled, not per-datagram: nothing on the receive path calls
+    // it, so its whole cost is one open+read+close of the kernel's socket table
+    // plus the decode. Measured, and the measurement checks that every sample
+    // was a real reading, so a call that had started failing cannot report a
+    // cheap zero.
+    #[cfg(target_os = "linux")]
+    let poll_cost_us = {
+        const SAMPLES: u32 = 1_000;
+        let start = Instant::now();
+        let mut per_socket = 0u32;
+        for _ in 0..SAMPLES {
+            if matches!(
+                std::hint::black_box(listener.kernel_refused()),
+                KernelRefused::PerSocket { .. }
+            ) {
+                per_socket += 1;
+            }
+        }
+        let per_call_us = start.elapsed().as_nanos() as f64 / f64::from(SAMPLES) / 1_000.0;
+        assert_eq!(
+            per_socket, SAMPLES,
+            "only {per_socket} of {SAMPLES} reads during the poll returned a per-socket count, so \
+             the timing is of a failing read"
+        );
+        per_call_us
+    };
     let offered = (BURST + 1) as u64;
     let dispatched = listener.stats().packets_dispatched.load(Relaxed);
     let self_refused = received.checked_sub(dispatched).expect(
@@ -216,6 +245,8 @@ async fn one_row(request: Option<usize>, label: &'static str) -> Row {
         dispatched,
         self_refused,
         delivered,
+        #[cfg(target_os = "linux")]
+        poll_cost_us,
     }
 }
 
@@ -308,34 +339,52 @@ async fn a_kernel_refusal_is_separable_and_the_receive_side_reconciles() {
                 },
                 KernelRefused::PerSocket { refused: end, .. },
             ) => {
-                let measured = end - start;
-                println!(
-                    "KERNEL_REFUSAL platform=linux label={} effective={} offered={} received={} \
+                #[cfg(not(target_os = "linux"))]
+                panic!(
+                    "{label}: no per-socket refusal count exists on {}, so this arm cannot run there \
+                     (read {start} then {end} from {source:?})",
+                    std::env::consts::OS
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    let measured = end - start;
+                    println!(
+                        "KERNEL_REFUSAL platform=linux label={} effective={} offered={} received={} \
                      dispatched={} self_refused={} delivered={} kernel_refused={measured} \
                      sender_derived={sender_derived} source={source:?}",
-                    row.label,
-                    row.effective,
-                    row.offered,
-                    row.received,
-                    row.dispatched,
-                    row.self_refused,
-                    row.delivered,
-                );
-                // The identity the operator cannot compute today: what the peer
-                // offered is what this layer read plus what the kernel refused.
-                assert_eq!(
-                    measured, sender_derived,
-                    "{label}: the kernel counted {measured} refusals but the sender's own \
+                        row.label,
+                        row.effective,
+                        row.offered,
+                        row.received,
+                        row.dispatched,
+                        row.self_refused,
+                        row.delivered,
+                    );
+                    // The identity the operator cannot compute today: what the peer
+                    // offered is what this layer read plus what the kernel refused.
+                    assert_eq!(
+                        measured, sender_derived,
+                        "{label}: the kernel counted {measured} refusals but the sender's own \
                      arithmetic gives {sender_derived} of {} offered and {} read",
-                    row.offered, row.received
-                );
-                assert_eq!(
-                    row.received + measured,
-                    row.offered,
-                    "{label}: received {} + kernel-refused {measured} != offered {}",
-                    row.received,
-                    row.offered
-                );
+                        row.offered, row.received
+                    );
+                    assert_eq!(
+                        row.received + measured,
+                        row.offered,
+                        "{label}: received {} + kernel-refused {measured} != offered {}",
+                        row.received,
+                        row.offered
+                    );
+                    // The reading is polled, not per-datagram: nothing on the
+                    // receive path calls it, so its whole cost is one open+read+
+                    // close of the kernel's socket table plus the decode. It is
+                    // measured, not asserted — the cost is a property of the host's
+                    // `/proc` and not of the receiver's correctness.
+                    println!(
+                        "KERNEL_REFUSAL platform=linux cost_us_per_call={:.3}",
+                        row.poll_cost_us
+                    );
+                }
             }
             (KernelRefused::NotPerSocket { reason }, KernelRefused::NotPerSocket { .. }) => {
                 #[cfg(target_os = "linux")]
