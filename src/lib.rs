@@ -16,6 +16,12 @@ use primitive::arena::obj_pool::{ArcObjPool, ObjScoped};
 use tokio::sync::{Notify, watch};
 
 mod conn;
+/// Platform-specific reads of the kernel's own per-socket refusal count.
+///
+/// Only the Linux reader calls the decoder outside its own tests, so on a
+/// platform without one the decoder is exercised by `cargo test` alone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod kernel_refusal;
 mod transmit;
 
 #[cfg(test)]
@@ -25,6 +31,7 @@ mod teardown_soak;
 
 use conn::ConnCloseToken;
 pub use conn::{Conn, ConnRead, ConnWrite};
+pub use kernel_refusal::{KernelRefused, RefusalSource};
 pub use transmit::UnreliableTransmit;
 
 pub const PACKET_BUFFER_LENGTH: usize = 2_usize.pow(16);
@@ -227,6 +234,39 @@ where
     /// state changed — a drain armed when the listener is removed — would read
     /// the stale state and either stop dispatching live flows or never stop.
     idle: watch::Sender<bool>,
+}
+impl<Utp, K, V> UtpListener<Utp, K, V>
+where
+    Utp: UnreliableTransmit,
+{
+    /// The kernel's own count of datagrams its receive path refused for this
+    /// listener's socket, before any `recv` could observe them.
+    ///
+    /// [`Self::stats`] cannot answer this. A datagram the kernel refused for a
+    /// full receive queue never reached `recv`, so it is neither in
+    /// `packets_received` nor a dispatcher drop: from inside this crate it is
+    /// indistinguishable from a datagram the path never delivered. With the
+    /// peer's own count of what it sent, this reading splits the difference
+    /// three ways:
+    ///
+    /// ```text
+    /// peer_offered     = packets_received + kernel_refused
+    /// packets_received = packets_dispatched + the drop counters in ListenerStats
+    /// ```
+    ///
+    /// and what is left after both subtractions is the path loss — the number
+    /// an operator needs to tell their ISP's loss from a receive buffer this
+    /// process could not drain, which is the whole reason a self-inflicted drop
+    /// currently reads as the path's.
+    ///
+    /// This is a **polled** reading, not a per-datagram one. On Linux it reads
+    /// `/proc/net/udp{,6}` (`sk_drops`, the same counter the `SO_RXQ_OVFL`
+    /// control message carries), so it costs a file read and must not be called
+    /// once per datagram. See [`KernelRefused`] for availability: on a platform
+    /// with no per-socket count it reports the absence, never a substitute.
+    pub fn kernel_refused(&self) -> KernelRefused {
+        kernel_refusal::read_socket(&*self.utp)
+    }
 }
 impl<Utp, K, V> core::fmt::Debug for UtpListener<Utp, K, V>
 where

@@ -278,10 +278,11 @@ are the only lib-tier cells this record claims.
 
 ## Blocks the checker reads
 
-Nothing is `#[ignore]`d, so the manifest is empty:
+The `#[ignore]`d scenarios, and the tier each belongs to:
 
 ```gate-manifest
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard
+kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles = standard
 ```
 
 The always-run cells the gate exists for are pinned as required-default, so a
@@ -298,6 +299,7 @@ accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
+kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
 ```
 
 Every one of them asserts, so the asserting set is the required set plus the
@@ -315,6 +317,8 @@ dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel
+kernel_refusal::the_per_socket_answer_is_the_platforms_and_is_never_a_substitute
+kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting
@@ -332,6 +336,7 @@ dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram = default | 0
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue = default | 0.03 | composite(depth,rate) | dispatch-sweep@depth=one-to-sixty-four+rate=achieved
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped = default | 0.01 | composite(buffer,reference,shape) | dispatcher-overflow@path=dispatch+shape=burst+reference=parked-reader+buffer=four-slots
 recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard | 1.9 | composite(size,name,load,split) | recv-buffer-drops@size=256-and-1200+name=so_rcvbuf+load=stalled-burst+split=kernel-vs-dispatcher
+kernel_refusal::a_kernel_refusal_is_separable_and_the_receive_side_reconciles = standard | 0.5 | composite(source,buffer,split) | kernel-refusal@source=proc-net-udp+buffer=floor-4KiB-and-host-default+split=kernel-vs-dispatcher
 ```
 
 ```gate-budgets
@@ -353,7 +358,10 @@ dispatcher-overflow@layer=repair = the repaired round trip a dropped datagram ca
 recv-buffer-drops@host=linux = the buffer depths are this host's (macOS); the deployed Linux default is carried as an explicit 212 992 B request, but Linux's `skb->truesize` accounting is not reproduced, so every Linux depth here is an upper bound.
 recv-buffer-drops@transport=rtp = `rtp` was off limits; the channel is sized to rtp's `DISPATCHER_BUF_SIZE` but the composing transport's own drain, repair ladder and congestion response are not exercised, and the per-flow drop's repair cost is not measured here.
 recv-buffer-drops@shape=live-dispatch-loop = the burst is offered while the dispatch task is not polled; with the loop live the kernel queue never accumulates, so this arm says nothing about a live-reader regime — `tokio_udp`'s `rcvbuf_cliff` measures that shape.
-recv-buffer-drops@metric=kernel-refusal-counter = the kernel's refused-datagram count is derived as `offered - received` by the sender, not read from the kernel; no such counter is observable from this crate, which is why the product still cannot separate a kernel drop from path loss.
+recv-buffer-drops@metric=kernel-refusal-counter = **closed for Linux, and only there.** The kernel's refused-datagram count is no longer derived by the sender: `UtpListener::kernel_refused` reads it from `/proc/net/udp{,6}`'s `drops` column (`sk_drops`), so `peer_offered = packets_received + kernel_refused` is computable and the residual is the path loss. The platform and mechanism limits that remain are the three gaps below.
+kernel-refusal@host=linux-musl = the per-socket reading was type-checked for `x86_64-unknown-linux-musl` on this host and run end-to-end on a remote x86_64 Linux host, not on the deployed hosts' kernels and not in the deployed musl build; the `/proc` column it reads is 13 whitespace-separated fields there and the Linux default `rmem_max` is far below the channel, so the above-knee regime of the sibling arm was not reachable on that host.
+kernel-refusal@host=macos = this host has no per-socket counter; the arm measures the host-wide `dropped due to full socket buffers` total instead, which every UDP socket on the machine contributes to, so on macOS the reconciliation it runs is that host-wide delta and not a reading the product reports.
+kernel-refusal@source=so-rxq-ovfl = the `SO_RXQ_OVFL` control message carries the same `sk_drops` count and is not implemented: it costs a control-message parse per received datagram and an enable step the transport's `recv_buf` path has no place for, where the polled `/proc` read costs one file read per sample. Neither mechanism is measured for cost on this host (no `/proc` here), so this is a source-level choice, not a measured one.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by

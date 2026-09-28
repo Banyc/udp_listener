@@ -63,8 +63,23 @@ pub trait UnreliableTransmit {
     fn try_send(&self, buf: &[u8]) -> std::io::Result<usize>;
     fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> std::io::Result<usize>;
     fn supports_send_vectored(&self) -> bool;
+    /// The file descriptor this transport receives on, when the platform and
+    /// the backend have one.
+    ///
+    /// Used only to name the socket in the kernel's own accounting
+    /// ([`crate::KernelRefused`]). A transport that is not a real socket — a
+    /// test double — keeps the default, and the reading is reported
+    /// unidentified rather than guessed.
+    #[cfg(unix)]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 impl UnreliableTransmit for tokio::net::UdpSocket {
+    #[cfg(unix)]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(self))
+    }
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.local_addr()
     }
@@ -105,6 +120,10 @@ impl UnreliableTransmit for tokio::net::UdpSocket {
 }
 
 impl UnreliableTransmit for tokio_udp::UdpSocket {
+    #[cfg(unix)]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(self))
+    }
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.local_addr()
     }
