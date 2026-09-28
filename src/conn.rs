@@ -1,6 +1,6 @@
 use std::{io::IoSlice, net::SocketAddr, sync::Arc};
 
-use crate::{ConnTable, UnreliableTransmit};
+use crate::{ConnStats, ConnTable, UnreliableTransmit};
 
 pub(crate) trait AnySendSyncStatic: Sync + Send + 'static {}
 impl<K, V> AnySendSyncStatic for ConnCloseToken<K, V>
@@ -37,7 +37,7 @@ where
         let mut conn_table = self.conn_table.lock().unwrap();
         let is_still_ours = conn_table
             .get(&self.conn_key)
-            .is_some_and(|tx| tx.same_channel(&self.tx));
+            .is_some_and(|entry| entry.tx.same_channel(&self.tx));
         if is_still_ours {
             conn_table.remove(&self.conn_key);
             if conn_table.is_empty() {
@@ -85,6 +85,12 @@ where
     pub fn conn_key(&self) -> &K {
         &self.conn_key
     }
+    /// This flow's own drop accounting (see [`ConnStats`]): the per-flow
+    /// counterpart of [`crate::ListenerStats::packets_dropped_dispatcher_full`],
+    /// which totals every flow on the listener.
+    pub fn stats(&self) -> &ConnStats {
+        self.read.stats()
+    }
     pub fn split(self) -> (ConnRead<V>, ConnWrite<Utp>) {
         (self.read, self.write)
     }
@@ -92,18 +98,26 @@ where
 
 pub struct ConnRead<V> {
     pub(crate) recv: tokio::sync::mpsc::Receiver<V>,
+    pub(crate) stats: Arc<ConnStats>,
     pub(crate) _close_token: Arc<dyn AnySendSyncStatic>,
 }
 impl<V> core::fmt::Debug for ConnRead<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConnRead")
             .field("recv.len()", &self.recv.len())
+            .field("stats", &self.stats)
             .finish()
     }
 }
 impl<V> ConnRead<V> {
     pub fn read_half(&mut self) -> &mut tokio::sync::mpsc::Receiver<V> {
         &mut self.recv
+    }
+    /// This flow's own drop accounting (see [`ConnStats`]): the per-flow
+    /// counterpart of [`crate::ListenerStats::packets_dropped_dispatcher_full`],
+    /// which totals every flow on the listener.
+    pub fn stats(&self) -> &ConnStats {
+        &self.stats
     }
 }
 

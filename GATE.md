@@ -14,14 +14,16 @@ declares, and what it does not cover.
 
 Measured on the tree this file is committed with, `cargo test --release`:
 
-* `-- --list --ignored` reports **0 ignored tests** in both targets (33 lib
-  tests, 9 integration tests). Nothing in this crate is `#[ignore]`d.
+* `-- --list --ignored` reports **0 ignored tests** in every target (33 lib
+  tests, 10 integration tests). Nothing in this crate is `#[ignore]`d.
 * There is **no bench target**: no `benches/` directory, no `[[bench]]` in
   `Cargo.toml`, no `criterion` in `Cargo.lock`.
-* The whole default tier costs **0.91 s** wall clock (`lib` 0.06 s,
-  `accept_churn_soak` 0.71 s, `dispatch_delay` 0.06 s). The churn target's cost
-  is one cell — `bursts_against_a_slow_acceptor_lose_no_dial` at 0.71 s — and
-  the lib tier is at the process-start floor.
+* The whole default tier costs **0.89 s** wall clock (`lib` 0.07 s,
+  `accept_churn_soak` 0.70 s, `dispatch_delay` 0.03 s, `dispatcher_overflow`
+  0.00 s). The churn target's cost is one cell —
+  `bursts_against_a_slow_acceptor_lose_no_dial` at 0.70 s — and the lib tier and
+  `dispatcher_overflow` are at the process-start floor (the overflow cell's own
+  median is 2.6 ms over ten process runs).
 
 So `gate-manifest` below is empty because the crate's ignored set is empty, not
 because the manifest is unwritten: the set the checker re-derives from the
@@ -32,8 +34,8 @@ per-datagram delay" below.
 
 ## The always-run liveness cells
 
-These seven are the crate's gate and are required-default: each is worth zero
-if it stops running. One *dial* is one datagram whose 8-byte token becomes the
+These seven are the crate's liveness gate and are required-default: each is
+worth zero if it stops running. One *dial* is one datagram whose 8-byte token becomes the
 flow key, so the assertion is an identity set over tokens (a token that never
 returns, returns twice, or returns from a different dial is a failure), never a
 timeout-absorbed count.
@@ -133,6 +135,51 @@ dependency graph, so loss, delay, reordering and rate shaping are the composing
 scenarios' to measure, not this crate's. It is recorded as a gap below rather
 than claimed as a row.
 
+## The dispatcher overflow, attributed to the flow that dropped
+
+`dispatch_next` never blocks: a full per-flow channel drops the datagram rather
+than backpressuring the accept loop. Dropping is the right policy for a reliable
+transport over UDP — `rtp` repairs it over a round trip — and this crate does not
+change it. What the arm asserts is that the drop is **readable**: the listener
+totals the overflow in `ListenerStats::packets_dropped_dispatcher_full`, and the
+same drop is counted against the flow whose buffer filled in
+`ConnStats::packets_dropped_dispatcher_full`, which a flow's `Conn::stats()` (or
+its split `ConnRead::stats()`) exposes. An aggregate alone cannot attribute an
+overload: at the moment a path is most degraded, the dropped datagrams are
+exactly the ones carrying no information about which flow to look at, and the
+repair is per flow.
+
+The arm is
+`dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped`
+(required-default, asserting, 0.01 s nominal against a measured 2.6 ms median
+over ten process runs): a 64-datagram burst is offered into a four-slot channel
+whose reader is parked, then drained. One run printed:
+
+```
+DISPATCH_OVERFLOW_STATS offered=65 received=65 delivered=4
+dropped_dispatcher_full_per_flow=61 dropped_dispatcher_full_aggregate=61
+channel_capacity=4 drop_rate=0.938 flows=1
+```
+
+so the offer exceeds the drain by a **drop rate of 0.938** while the channel
+still delivers its whole capacity — the arm measures an overload, not an outage.
+It asserts the per-flow count (61, not merely "non-zero"), the identity
+`offered == delivered + dropped`, the flow's count equalling the listener's total
+over the one flow, and the split read half agreeing with the connection it came
+from. Both counters were probed: with the per-flow increment removed the arm is
+red naming `the flow's own overflow count is 0, not 61` (while the aggregate
+still printed 61), and with the listener's increment removed the lib cell
+`counters_distinguish_dispatcher_buffer_overflows` is red.
+
+What this layer **cannot** show is the drop's consequence one layer up. `rtp`
+repairs a lost datagram with a retransmission a round trip later, and that
+repaired round trip is `rtp`'s to measure — this crate has no `rtp` dependency.
+The count is the deliverable; the repair is recorded as a gap below.
+
+Its one `gate-perf-design` cell varies the offer shape, the reader state and the
+channel bound together and is a composite for that reason: a ping-pong against a
+bare socket cannot overflow anything.
+
 ### The tooling gaps this file recorded, and their state
 
 1. **The lib target was outside the manifest — closed.** The manifest set is
@@ -186,6 +233,7 @@ accept_churn_soak::accept_queue_at_its_bound_accounts_for_every_flow
 accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
+dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
 ```
 
 Every one of them asserts, so the asserting set equals the required set (there
@@ -201,6 +249,7 @@ accept_churn_soak::accept_queue_at_its_bound_accounts_for_every_flow
 accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
+dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting
@@ -216,6 +265,7 @@ achieved rate:
 ```gate-perf-design
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram = default | 0.03 | baseline | dispatch-floor@path=dispatch+shape=ping-pong+reference=bare-socket
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue = default | 0.03 | composite(depth,rate) | dispatch-sweep@depth=one-to-sixty-four+rate=achieved
+dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped = default | 0.01 | composite(buffer,reference,shape) | dispatcher-overflow@path=dispatch+shape=burst+reference=parked-reader+buffer=four-slots
 ```
 
 ```gate-budgets
@@ -232,6 +282,7 @@ impairment@crate=udp_listener = no impairment instrument is reachable: the crate
 dispatch-floor@host=linux = the floor is measured on the host the suite runs on; the deployed target is linux-musl, and no linux measurement of this path exists here
 dispatch-floor@metric=syscall-count = the syscall and copy counts are properties of the composed paths and are measured in `tokio_udp`; this crate's arm differences them by cost rather than counting them
 dispatch-sweep@lane=multiplexed = the sweep drives one flow; several flows sharing the dispatcher is `rtp`'s composition, not a cell this crate can attribute.
+dispatcher-overflow@layer=repair = the repaired round trip a dropped datagram causes is `rtp`'s to measure; this crate has no `rtp` dependency, so the arm reads the drop and its delivery consequence only.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by

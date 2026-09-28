@@ -67,7 +67,11 @@ pub struct ListenerStats {
     /// conntrack entry, or handler task is allocated, so unauthenticated
     /// continuation-only datagrams cannot force resource allocation.
     pub packets_dropped_existing_only: AtomicU64,
-    /// Datagrams dropped because the sub-connection's dispatcher buffer was full.
+    /// Datagrams dropped because a sub-connection's dispatcher buffer was full.
+    ///
+    /// The listener-wide total. The same drop is counted against the flow whose
+    /// buffer filled in [`ConnStats::packets_dropped_dispatcher_full`], which is
+    /// the reading that names *which* flow an overload degraded.
     pub packets_dropped_dispatcher_full: AtomicU64,
     /// Datagrams dropped because they filled the whole packet buffer.
     pub packets_dropped_pkt_buf_overflow: AtomicU64,
@@ -92,6 +96,43 @@ impl ListenerStats {
         }
     }
 }
+
+/// Drop accounting for ONE sub-connection.
+///
+/// [`ListenerStats`] records *that* a dispatcher overflow happened; this records
+/// *which* flow it happened to. The aggregate cannot attribute an overload: with
+/// several flows sharing a listener, a non-zero
+/// [`ListenerStats::packets_dropped_dispatcher_full`] says some flow's dispatcher
+/// buffer filled without saying which one — and a reliable transport repairs per
+/// flow, so the flow that will retransmit over a round trip is the flow a reader
+/// needs named.
+///
+/// One instance is created with each flow's channel, incremented by the dispatch
+/// that finds that channel full, and shared into the flow's read half, where
+/// [`Conn::stats`] and [`ConnRead::stats`] expose it. Dropping the datagram is
+/// unchanged: this makes the drop attributable, not different.
+#[derive(Debug, Default)]
+pub struct ConnStats {
+    /// Datagrams dropped because this sub-connection's dispatcher buffer was full.
+    pub packets_dropped_dispatcher_full: AtomicU64,
+}
+
+/// One flow's entry in the listener's connection table: the channel its
+/// datagrams are dispatched into, and that flow's own drop accounting.
+pub(crate) struct ConnEntry<V> {
+    pub(crate) tx: tokio::sync::mpsc::Sender<V>,
+    pub(crate) stats: Arc<ConnStats>,
+}
+impl<V> core::fmt::Debug for ConnEntry<V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConnEntry")
+            .field("tx", &self.tx)
+            .field("stats", &self.stats)
+            .finish()
+    }
+}
+
+pub(crate) type ConnTable<K, V> = Arc<Mutex<HashMap<K, ConnEntry<V>>>>;
 
 /// Coarse rate limiter so high-frequency drop paths do not spam the log.
 struct RateLimiter {
@@ -145,8 +186,6 @@ pub struct Classified<K, V> {
 
 pub type Classify<Addr, K, V> =
     Arc<dyn Fn(&Addr, Packet) -> Option<Classified<K, V>> + Sync + Send + 'static>;
-
-pub(crate) type ConnTable<K, V> = Arc<Mutex<HashMap<K, tokio::sync::mpsc::Sender<V>>>>;
 
 /// Manage user-defined sub-connections under a unreliable transmission socket.
 pub struct UtpListener<Utp, K, V>
@@ -364,8 +403,8 @@ where
 
         let mut conn_table = self.conn_table.lock().unwrap();
 
-        if let Some(tx) = conn_table.get(&key) {
-            match tx.try_send(value) {
+        if let Some(entry) = conn_table.get(&key) {
+            match entry.tx.try_send(value) {
                 Ok(_) => {
                     self.stats
                         .packets_dispatched
@@ -373,6 +412,10 @@ where
                     return Ok(Dispatch::Routed);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    entry
+                        .stats
+                        .packets_dropped_dispatcher_full
+                        .fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .packets_dropped_dispatcher_full
                         .fetch_add(1, Ordering::Relaxed);
@@ -395,7 +438,14 @@ where
 
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
         tx.try_send(value).unwrap();
-        conn_table.insert(key.clone(), tx.clone());
+        let conn_stats = Arc::new(ConnStats::default());
+        conn_table.insert(
+            key.clone(),
+            ConnEntry {
+                tx: tx.clone(),
+                stats: Arc::clone(&conn_stats),
+            },
+        );
         self.stats
             .packets_dispatched
             .fetch_add(1, Ordering::Relaxed);
@@ -405,7 +455,7 @@ where
 
         drop(conn_table);
 
-        let conn = self.conn_from_parts(key, tx, rx, addr);
+        let conn = self.conn_from_parts(key, tx, conn_stats, rx, addr);
         {
             let mut accept_queue = self.accept_queue.lock().unwrap();
             if accept_queue.len() >= ACCEPT_QUEUE_CAPACITY {
@@ -490,17 +540,27 @@ where
     pub fn register_conn(&self, conn_key: K) -> Option<Conn<Utp, K, V>> {
         let peer_addr = self.utp.peer_addr().ok()?;
         let mut conn_table = self.conn_table.lock().unwrap();
-        if conn_table.get(&conn_key).is_some_and(|tx| !tx.is_closed()) {
+        if conn_table
+            .get(&conn_key)
+            .is_some_and(|entry| !entry.tx.is_closed())
+        {
             return None;
         }
         let (tx, rx) = tokio::sync::mpsc::channel(self.dispatcher_buffer_size.get());
-        conn_table.insert(conn_key.clone(), tx.clone());
+        let conn_stats = Arc::new(ConnStats::default());
+        conn_table.insert(
+            conn_key.clone(),
+            ConnEntry {
+                tx: tx.clone(),
+                stats: Arc::clone(&conn_stats),
+            },
+        );
         drop(conn_table);
         self.idle.send_replace(false);
         self.stats
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
-        Some(self.conn_from_parts(conn_key, tx, rx, peer_addr))
+        Some(self.conn_from_parts(conn_key, tx, conn_stats, rx, peer_addr))
     }
 
     /// Pass in `peer_addr` as [`None`] iff the underlying unreliable transmission socket is connected.
@@ -508,6 +568,7 @@ where
         &self,
         conn_key: K,
         tx: tokio::sync::mpsc::Sender<V>,
+        conn_stats: Arc<ConnStats>,
         rx: tokio::sync::mpsc::Receiver<V>,
         peer_addr: SocketAddr,
     ) -> Conn<Utp, K, V> {
@@ -520,6 +581,7 @@ where
         let close_token = Arc::new(close_token);
         let read = ConnRead {
             recv: rx,
+            stats: conn_stats,
             _close_token: close_token.clone(),
         };
         let udp_to = if self.is_utp_connected {
