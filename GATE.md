@@ -64,13 +64,13 @@ fatal:
 The crate *is* scalable without rebuilding, but by environment variable rather
 than by `#[ignore]`, so the blocks derived from the `#[ignore]` set cannot see
 it: those are the scenario directory's ignored set (`ignored_scenarios`,
-`check-gate.py:3412`, over the scenario targets at `:3544`) resolved through
-`cargo test --list` (`:3379`). `gate-env-tier` is the block for such a
-surface, and `check-gate.py:2769-2875` is what enforces it: detection needs a
-crate script *and* a Rust source to name the variable (`:2796-2799`, closed
-transitively over the crate's own calls at `:3001`), a detected name the
-declaration omits is an error (`:2822-2830`), and a declared name must be read
-by a source (`:2842-2848`) and named by the surface's runner (`:2849-2856`).
+`netem-tools check-gate`, over the scenario targets) resolved through
+`cargo test --list`. `gate-env-tier` is the block for such a
+surface, and `netem-tools check-gate` is what enforces it: detection needs a
+crate script *and* a Rust source to name the variable (closed
+transitively over the crate's own calls), a detected name the
+declaration omits is an error, and a declared name must be read
+by a source and named by the surface's runner.
 
 * `SOAK_DIALERS`, `SOAK_ITERATIONS`, `SOAK_SEED`, `SOAK_ACCEPTORS`,
   `SOAK_DIAL_TIMEOUT_MS` (`tests/accept_churn_soak.rs:105-109`),
@@ -94,7 +94,7 @@ latency or a goodput.
 
 The block carries **one row**, because a row's runner must be a file under the
 crate root that names at least one of the row's variables
-(`check-gate.py:2833-2838`, `:2849-2856`) and the four `SOAK_WAKE_*` names have
+(enforced by `netem-tools check-gate`) and the four `SOAK_WAKE_*` names have
 no script runner: they are read in-process (`src/accept_queue_soak.rs:465-467`)
 and sized by whoever invokes `cargo test`. They are therefore declared in the
 one row beside the runner that does exist, and that row's `measures` says which
@@ -136,11 +136,11 @@ than claimed as a row.
 ### The tooling gaps this file recorded, and their state
 
 1. **The lib target was outside the manifest — closed.** The manifest set is
-   still the scenario directory's `#[ignore]` set (`check-gate.py:3412`,
-   `:3544`) resolved through `cargo test --list` (`:3379`), but the reserved
-   `lib` target is now derived beside it (`:3560`) and is nameable in
+   still the scenario directory's `#[ignore]` set (`netem-tools check-gate`)
+   resolved through `cargo test --list`, but the reserved
+   `lib` target is now derived beside it and is nameable in
    `gate-manifest`, `gate-default-required` and `gate-asserting` as a
-   `lib::<module>::<test>` line (`TargetListings`, `:3138-3160`), resolved
+   `lib::<module>::<test>` line (`TargetListings`), resolved
    through `cargo test -p <package> --lib` rather than the non-target
    `--test lib`. Probed on this crate: adding
    `lib::accept_queue_soak::a_burst_enqueued_before_any_waiter_is_handed_back_once_and_in_bound`
@@ -148,14 +148,14 @@ than claimed as a row.
    missing from gate-asserting`, which is the lib target's own test list. The
    two lib-tier wake-bound cells this file claims are therefore nameable; they
    stay named in prose here rather than added to the required set, because a
-   lib opt-in no block names is an advisory note and never a failure
-   (`:3575-3593`), and no lib test of this crate is `#[ignore]`d.
+   lib opt-in no block names is an advisory note and never a failure,
+   and no lib test of this crate is `#[ignore]`d.
 2. **An env-scaled opt-in tier was invisible to every gate — closed by
    `gate-env-tier`**, the block at the end of this file. It names the
    variables, the runner, the measured quantity and the cells, parses as
    `<name> = <vars> | <runner> | <measures> | <cells>`
-   (`check-gate.py:2880-2962`), and detects the surface it declares from a
-   script name *and* a Rust read (`:2796-2799`), so it cannot go stale in
+   (`netem-tools check-gate`), and detects the surface it declares from a
+   script name *and* a Rust read, so it cannot go stale in
    silence. Its one limit is a variable with **no script runner**, which is why
    the four `SOAK_WAKE_*` names share the churn row and are separated by that
    row's `measures` field.
@@ -246,5 +246,5 @@ soak-accept-churn = SOAK_DIALERS,SOAK_ITERATIONS,SOAK_SEED,SOAK_ACCEPTORS,SOAK_D
 Run it from this crate's root:
 
 ```sh
-python3 ../netem_test/tools/check-gate.py --crate . udp_listener tests GATE.md
+netem-tools check-gate --crate . udp_listener tests GATE.md
 ```
