@@ -10,12 +10,13 @@ visible to a counter alone, only to a test that dials and requires the flow
 back. This file is the authoritative record of what this crate runs, what it
 declares, and what it does not cover.
 
-## The surface: there is no opt-in tier
+## The surface: one opt-in tier
 
 Measured on the tree this file is committed with, `cargo test --release`:
 
-* `-- --list --ignored` reports **0 ignored tests** in every target (33 lib
-  tests, 10 integration tests). Nothing in this crate is `#[ignore]`d.
+* `-- --list --ignored` reports **1 ignored test**: the receive-buffer drop-site
+  sweep below (`recv_buffer_drop_sites`). Every other test in the crate is
+  required-default.
 * There is **no bench target**: no `benches/` directory, no `[[bench]]` in
   `Cargo.toml`, no `criterion` in `Cargo.lock`.
 * The whole default tier costs **0.89 s** wall clock (`lib` 0.07 s,
@@ -23,14 +24,15 @@ Measured on the tree this file is committed with, `cargo test --release`:
   0.00 s). The churn target's cost is one cell —
   `bursts_against_a_slow_acceptor_lose_no_dial` at 0.70 s — and the lib tier and
   `dispatcher_overflow` are at the process-start floor (the overflow cell's own
-  median is 2.6 ms over ten process runs).
+  median is 2.6 ms over ten process runs). The new sweep is `#[ignore]`d and so
+  is not part of this cost.
 
-So `gate-manifest` below is empty because the crate's ignored set is empty, not
-because the manifest is unwritten: the set the checker re-derives from the
-compiled binaries *is* the empty set. The dual mandate's *time* half has
-nothing to shorten here — the always-run tier is under a second — and its
-*coverage* half declares the delay measurement under "The dispatch path's
-per-datagram delay" below.
+So `gate-manifest` below carries one line, the opt-in sweep; the checker
+re-derives that set from the compiled binaries, so a test silently re-ignored is
+an error. The dual mandate's *time* half still has nothing to shorten in the
+always-run tier — it is under a second — and its *coverage* half declares the
+delay measurement under "The dispatch path's per-datagram delay" and the
+buffer split under "The two receive-side buffers" below.
 
 ## The always-run liveness cells
 
@@ -180,6 +182,67 @@ Its one `gate-perf-design` cell varies the offer shape, the reader state and the
 channel bound together and is a composite for that reason: a ping-pong against a
 bare socket cannot overflow anything.
 
+## The two receive-side buffers: which drop site is attributable
+
+`rtp` reaches the network through two buffers in series. The kernel's receive
+queue is sized by `tokio_udp::UdpSocket::set_recv_buffer_size` (exposed by
+`tokio_udp` v0.0.6 but, in this workspace, called by no consumer), and this
+crate's per-flow dispatcher channel is sized by the `dispatcher_buffer_size`
+argument to `UtpListener::new`. A datagram can be refused at either, and the two
+refusals differ in consequence: the dispatcher counts its refusal against the
+flow whose channel filled
+(`ConnStats::packets_dropped_dispatcher_full`, the accessor this crate gained),
+while a datagram the kernel refused before `recv` was never seen here, so from
+inside `udp_listener` it is indistinguishable from path loss.
+
+`recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel`
+(opt-in, `standard` tier, asserting, measured 1.9 s) offers
+`BURST = 32 768` datagrams while nothing reads the socket — a scheduling stall,
+the only shape in which the kernel queue accumulates — then starts the dispatch
+loop and reads both sites. It sweeps five budgets at two payload sizes against a
+channel sized to `rtp`'s own `DISPATCHER_BUF_SIZE` (1024, `rtp/src/udp.rs:71`).
+One run, load 6–11 on ten cores, release:
+
+```
+RECV_BUFFER_DROP_SITES size=256   label=floor-4KiB     effective=4096    offered=32769 received=15    channel_accepted=15   dispatcher_dropped=0     kernel_dropped=32754 delivered=15   total_lost=32754
+RECV_BUFFER_DROP_SITES size=256   label=linux-default  effective=212992  offered=32769 received=740   channel_accepted=740  dispatcher_dropped=0     kernel_dropped=32029 delivered=740  total_lost=32029
+RECV_BUFFER_DROP_SITES size=256   label=host-default   effective=786896  offered=32769 received=2733  channel_accepted=1024 dispatcher_dropped=1709  kernel_dropped=30036 delivered=1024 total_lost=31745
+RECV_BUFFER_DROP_SITES size=256   label=1MiB           effective=1048576 offered=32769 received=3641  channel_accepted=1024 dispatcher_dropped=2617  kernel_dropped=29128 delivered=1024 total_lost=31745
+RECV_BUFFER_DROP_SITES size=256   label=4MiB           effective=4194304 offered=32769 received=14564 channel_accepted=1024 dispatcher_dropped=13540 kernel_dropped=18205 delivered=1024 total_lost=31745
+RECV_BUFFER_DROP_SITES size=1200  label=4MiB           effective=4194304 offered=32769 received=3405  channel_accepted=1024 dispatcher_dropped=2381  kernel_dropped=29364 delivered=1024 total_lost=31745
+```
+
+The mechanism is an identity, not a trade: `offered = received + kernel_dropped`,
+`received = channel_accepted + dispatcher_dropped`, and
+`channel_accepted = min(received, 1024)`. Below a buffer holding 1024 datagrams
+the dispatcher drops nothing and all loss is kernel-side, so sizing the buffer
+there *reduces* total loss (32 754 → 32 029 → 31 745); above that knee the
+channel is saturated, total loss is pinned at `offered - 1024 = 31 745` whatever
+the buffer holds, and every extra datagram a larger buffer admits becomes a
+`dispatcher_dropped`. The dispatcher drop never falls as the buffer grows — the
+256 B series is 0, 0, 1709, 2617, 13540 — and the residual loss is the channel's.
+
+What this means is a refusal, not a default: sizing the kernel buffer does not
+reduce the per-flow dispatcher drop; it reduces the kernel drop — the one the
+operator cannot tell from path loss — only up to the channel's own depth, and
+beyond that it merely relocates the drop onto the attributable counter. The
+lever for the residual is the channel capacity (and the consumer's drain), not
+the socket buffer.
+
+The two sites are separable *in this arm* because the arm is the sender and so
+knows `offered`, making `kernel_dropped = offered - received`. In production the
+listener knows neither `offered` nor the kernel's refusal count, so it still
+cannot tell a kernel drop from path loss; that gap is recorded below.
+
+Both properties this arm rests on were probed. Removing the per-flow
+`fetch_add` in `src/lib.rs` (one occurrence before the edit) turns it red naming
+`size 256 host-default: the flow's own overflow count is 0 but the listener
+totals 1709 over its one flow`. Removing the `set_recv_buffer_size` call in the
+arm's own fixture turns it red naming `size 256: the sweep's 5-row budget series
+did not produce strictly increasing effective buffer sizes: [("floor-4KiB",
+786896), …]` — every row at the host default, which is the fixture measuring
+nothing. Both were restored with `touch` and the pristine run is green.
+
 ### The tooling gaps this file recorded, and their state
 
 1. **The lib target was outside the manifest — closed.** The manifest set is
@@ -218,6 +281,7 @@ are the only lib-tier cells this record claims.
 Nothing is `#[ignore]`d, so the manifest is empty:
 
 ```gate-manifest
+recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard
 ```
 
 The always-run cells the gate exists for are pinned as required-default, so a
@@ -236,8 +300,8 @@ dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
 ```
 
-Every one of them asserts, so the asserting set equals the required set (there
-is no `standard`/`full` scenario, because there is no `#[ignore]`d test):
+Every one of them asserts, so the asserting set is the required set plus the
+one opt-in scenario:
 
 ```gate-asserting
 accept_churn_soak::churn_over_the_combined_accept_path_loses_no_dial
@@ -250,6 +314,7 @@ accept_churn_soak::a_failed_dialer_does_not_strand_the_other_round_participants
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped
+recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel
 ```
 
 No `perf`-tier scenario exists, so no report-only body can reach an asserting
@@ -266,10 +331,12 @@ achieved rate:
 dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram = default | 0.03 | baseline | dispatch-floor@path=dispatch+shape=ping-pong+reference=bare-socket
 dispatch_delay::the_dispatch_rate_sweep_separates_a_toll_from_a_queue = default | 0.03 | composite(depth,rate) | dispatch-sweep@depth=one-to-sixty-four+rate=achieved
 dispatcher_overflow::a_dispatcher_overflow_is_attributed_to_the_flow_that_dropped = default | 0.01 | composite(buffer,reference,shape) | dispatcher-overflow@path=dispatch+shape=burst+reference=parked-reader+buffer=four-slots
+recv_buffer_drop_sites::sizing_the_receive_buffer_moves_a_drop_between_sites_and_the_knee_is_the_channel = standard | 1.9 | composite(size,name,load,split) | recv-buffer-drops@size=256-and-1200+name=so_rcvbuf+load=stalled-burst+split=kernel-vs-dispatcher
 ```
 
 ```gate-budgets
 default = 1
+standard = 5
 full = 60
 perf = 60
 baseline = dispatch_delay::the_dispatch_path_adds_no_floor_to_a_lone_datagram
@@ -283,6 +350,10 @@ dispatch-floor@host=linux = the floor is measured on the host the suite runs on;
 dispatch-floor@metric=syscall-count = the syscall and copy counts are properties of the composed paths and are measured in `tokio_udp`; this crate's arm differences them by cost rather than counting them
 dispatch-sweep@lane=multiplexed = the sweep drives one flow; several flows sharing the dispatcher is `rtp`'s composition, not a cell this crate can attribute.
 dispatcher-overflow@layer=repair = the repaired round trip a dropped datagram causes is `rtp`'s to measure; this crate has no `rtp` dependency, so the arm reads the drop and its delivery consequence only.
+recv-buffer-drops@host=linux = the buffer depths are this host's (macOS); the deployed Linux default is carried as an explicit 212 992 B request, but Linux's `skb->truesize` accounting is not reproduced, so every Linux depth here is an upper bound.
+recv-buffer-drops@transport=rtp = `rtp` was off limits; the channel is sized to rtp's `DISPATCHER_BUF_SIZE` but the composing transport's own drain, repair ladder and congestion response are not exercised, and the per-flow drop's repair cost is not measured here.
+recv-buffer-drops@shape=live-dispatch-loop = the burst is offered while the dispatch task is not polled; with the loop live the kernel queue never accumulates, so this arm says nothing about a live-reader regime — `tokio_udp`'s `rcvbuf_cliff` measures that shape.
+recv-buffer-drops@metric=kernel-refusal-counter = the kernel's refused-datagram count is derived as `offered - received` by the sender, not read from the kernel; no such counter is observable from this crate, which is why the product still cannot separate a kernel drop from path loss.
 ```
 
 The crate is scaled without rebuilding by `SOAK_*` variables rather than by
