@@ -105,6 +105,15 @@ const CAPACITIES: [usize; 6] = [64, 256, 1024, 2048, 4096, 8192];
 const RECV_BUF: usize = 4 << 20;
 const QUIESCE_BOUND: Duration = Duration::from_secs(15);
 
+/// The two arms in this binary share the process-global counting allocator, so
+/// their `bytes` and `leaked` readings are only each other's if they do not run
+/// at the same time. `cargo test` runs test functions concurrently, and either
+/// arm's in-flight buffers inflate the other's subtraction (measured on the
+/// unmodified tree: the stalled arm's `leaked` check failed while the live arm
+/// held its own buffers). This guard serializes them; the arms, their windows,
+/// capacities and thresholds are unchanged.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 type SweepListener = UtpListener<UdpSocket, SocketAddr, Packet>;
 
 fn loopback() -> SocketAddr {
@@ -261,6 +270,7 @@ async fn stalled_row(capacity: usize) -> Row {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "sweeps six channel capacities against a 4096-datagram burst; the `standard` tier, declared in GATE.md"]
 async fn the_channel_capacity_sets_the_burst_a_stalled_consumer_accumulates() {
+    let _serial = SERIAL.lock().await;
     let baseline = LIVE.load(Relaxed);
     let mut rows = Vec::new();
     for capacity in CAPACITIES {
@@ -544,6 +554,7 @@ async fn live_row(capacity: usize) -> LiveRow {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "sweeps three channel capacities under a live drain; the `standard` tier, declared in GATE.md"]
 async fn a_live_consumer_capacity_sweep_shows_the_stall_coverage() {
+    let _serial = SERIAL.lock().await;
     let mut rows = Vec::new();
     for capacity in LIVE_CAPACITIES {
         let row = live_row(capacity).await;
