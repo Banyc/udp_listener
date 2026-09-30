@@ -26,6 +26,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 CRATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -216,7 +217,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=900.0, help="per batch")
     parser.add_argument("--build-timeout", type=float, default=1800.0)
     parser.add_argument(
-        "--log-dir", default="/Users/charliesmith/code/tmp/it87-soak-logs"
+        "--log-dir",
+        default=os.path.join(tempfile.gettempdir(), "accept-churn-soak-logs"),
     )
     parser.add_argument(
         "--modes",
