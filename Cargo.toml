@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1"
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.61" }
 tokio = { version = "1", features = [
     "bytes",
     "io-util",
